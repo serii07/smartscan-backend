@@ -10,7 +10,7 @@ def clean_product_name(raw_product_name: str) -> str:
     blacklist = [
         "buy", "online", "price", "at", "best", ":", "|",
         "amazon.in", "flipkart.com", "aap ka bazar", "beauty", "BigBasket",
-        "Aapkabazaar.co", "Amazon"
+        "Aapkabazar.co", "Amazon"
     ]
 
     words = cleaned.split()
