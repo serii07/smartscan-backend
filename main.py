@@ -14,15 +14,21 @@ def root():
 
 @app.post("/analyze-product")
 def analyze_product(request: BarcodeRequest):
-    product_data = fetch_product_from_google(request.barcode)
+    try:
+        result = fetch_product_from_google(request.barcode)
 
-    if not product_data:
-        return {"error": "Product not found"}
-    
-    barcode_image_url = None
-    if request.barcode_type:
-        barcode_image_url = f"https://barcode.orcascan.com/?type={request.barcode_type}&data={request.barcode}&format=jpg"
+        if not result:
+            return {"error": "Product not found"}
 
-    result["barcode_image_url"] = barcode_image_url
+        barcode_image_url = None
+        if request.barcode_type:
+            barcode_image_url = f"https://barcode.orcascan.com/?type={request.barcode_type}&data={request.barcode}&format=jpg"
 
-    return product_data
+        result["barcode_image_url"] = barcode_image_url
+
+        return result
+
+    except Exception as e:
+        print("CRASH:", e)
+        return {"error": "Internal server error"}
+
