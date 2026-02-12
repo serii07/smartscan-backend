@@ -21,8 +21,11 @@ def fetch_product_from_google(barcode: str):
     search_url = f"https://www.googleapis.com/customsearch/v1?q={barcode}&key={GOOGLE_API_KEY}&cx={SEARCH_ENGINE_ID}"
 
     response = requests.get(search_url)
-    data = response.json()
 
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
     items = data.get("items")
 
     if not items:
@@ -31,17 +34,34 @@ def fetch_product_from_google(barcode: str):
     for item in items:
         title = item.get("title", "Unknown Product")
 
-        pagemap = item.get("pagemap", {})
+        pagemap = item.get("pagemap")
+        if not pagemap:
+            continue
+
         cse_images = pagemap.get("cse_image")
+        if not cse_images:
+            continue
 
-        if cse_images:
-            image_url = cse_images[0].get("src")
+        image_url = cse_images[0].get("src")
+        if not image_url:
+            continue
 
-            if image_url and "transparentImg" not in image_url:
-                return {
-                    "barcode": barcode,
-                    "product_name": clean_product_name(title),
-                    "image_url": image_url
-                }
+        image_url_lower = image_url.lower()
+
+        if image_url_lower.endswith(".svg"):
+            continue
+
+        if "transparentimg" in image_url_lower:
+            continue
+
+        if "logo" in image_url_lower:
+            continue
+
+        return {
+            "barcode": barcode,
+            "product_name": clean_product_name(title),
+            "image_url": image_url
+        }
 
     return None
+
