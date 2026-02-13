@@ -66,3 +66,34 @@ def fetch_product_from_google(barcode: str):
 
     return None
 
+def openFoodAPI_fetch(barcode: str):
+    url = "https://world.openfoodfacts.net/api/v2/product/{barcode}.json?product_type=food&knowledge_panels_excluded=enviroment_card"
+
+    headers = {
+        Authorization: "Basic " + btoa("off:off") 
+    }
+
+    try:
+        response = requests.get(url)
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+    
+        if data.get("status") != 1:
+            return None
+
+        product = data.get("product", {})
+
+        return {
+            "ingredients": product.get("ingredients_text"),
+            "nutriscore": product.get("nutriscore_grade"),
+            "nova_group": product.get("nova_group"),
+            "allergens": product.get("allergens"),
+            "quantity": product.get("quantity"),
+            "brands": product.get("brands"),
+        }
+
+    except requests.RequestException:
+        return None
