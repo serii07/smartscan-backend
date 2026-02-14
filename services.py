@@ -67,7 +67,7 @@ def fetch_product_from_google(barcode: str):
     return None
 
 def openFoodAPI_fetch(barcode: str):
-    url = "https://world.openfoodfacts.net/api/v2/product/{barcode}.json?product_type=food&knowledge_panels_excluded=enviroment_card"
+    url = f"https://world.openfoodfacts.net/api/v2/product/{barcode}.json?product_type=food&knowledge_panels_excluded=environment_card"
 
 
     try:
