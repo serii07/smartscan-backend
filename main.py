@@ -15,10 +15,18 @@ def root():
 @app.post("/analyze-product")
 def analyze_product(request: BarcodeRequest):
     try:
+        print(f"\n Incoming request for barcode: {request.barcode}")
+
         google_data = fetch_product_from_google(request.barcode)
         food_data = openFoodAPI_fetch(request.barcode)
+        if food_data:
+            print("OpenFoodFacts success")
+            print(f"Ingredients: {food_data.get('ingredients')}")
+        else:
+            print("OpenFoodFacts failed")
 
         if not google_data and not food_data:
+            print("No data")
             return {"error": "Product not found"}
 
         barcode_image_url = None
