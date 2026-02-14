@@ -21,7 +21,7 @@ def clean_product_name(raw_product_name: str) -> str:
 def fetch_product_from_google(barcode: str):
     search_url = f"https://www.googleapis.com/customsearch/v1?q={barcode}&key={GOOGLE_API_KEY}&cx={SEARCH_ENGINE_ID}"
 
-    response = requests.get(url, timeout=5)
+    response = requests.get(search_url, timeout=5)
 
     if response.status_code != 200:
         return None
