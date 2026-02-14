@@ -43,12 +43,16 @@ def analyze_product(request: BarcodeRequest):
             "product_name": google_data.get("product_name") if google_data else None,
             "image_url": google_data.get("image_url") if google_data else None,
             "barcode_image_url": barcode_image_url,
+
+            # OFF data
             "ingredients": food_data.get("ingredients") if food_data else None,
-            "nutriscore": food_data.get("nutriscore") if food_data else None,
+            "nutrition_grade": food_data.get("nutrition_grade") if food_data else None,
+            "nutriscore_data": food_data.get("nutriscore_data") if food_data else None,
+            "nutriments": food_data.get("nutriments") if food_data else None,
             "nova_group": food_data.get("nova_group") if food_data else None,
-            "countries": food_data.get("countries") if food_data else None,
-            "quantity": food_data.get("quantity") if food_data else None,
+            "allergens": food_data.get("allergens") if food_data else None,
         }
+
 
         return final_response
 

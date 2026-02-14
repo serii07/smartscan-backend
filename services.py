@@ -21,7 +21,7 @@ def clean_product_name(raw_product_name: str) -> str:
 def fetch_product_from_google(barcode: str):
     search_url = f"https://www.googleapis.com/customsearch/v1?q={barcode}&key={GOOGLE_API_KEY}&cx={SEARCH_ENGINE_ID}"
 
-    response = requests.get(search_url)
+    response = requests.get(url, timeout=5)
 
     if response.status_code != 200:
         return None
@@ -67,11 +67,23 @@ def fetch_product_from_google(barcode: str):
     return None
 
 def openFoodAPI_fetch(barcode: str):
-    url = f"https://world.openfoodfacts.net/api/v2/product/{barcode}.json?product_type=food&knowledge_panels_excluded=environment_card"
+    url = (
+        f"https://world.openfoodfacts.net/api/v2/product/{barcode}"
+        "?fields=product_name,"
+        "nutrition_grades,"
+        "nutriscore_data,"
+        "nutriments,"
+        "ingredients_text,"
+        "nova_group,"
+        "allergens,"
+        "quantity,"
+        "brands,"
+        "misc_tags"
+    )
 
 
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
 
         if response.status_code != 200:
             return None
@@ -85,11 +97,11 @@ def openFoodAPI_fetch(barcode: str):
 
         return {
             "ingredients": product.get("ingredients_text"),
-            "nutriscore": product.get("nutriscore_grade"),
+            "nutrition_grade": product.get("nutrition_grades"),
+            "nutriscore_data": product.get("nutriscore_data"),
+            "nutriments": product.get("nutriments"),
             "nova_group": product.get("nova_group"),
-            "allergens": product.get("allergens"),
-            "quantity": product.get("quantity"),
-            "brands": product.get("brands"),
+            "allergens": product.get("allergens")
         }
 
     except requests.RequestException:
