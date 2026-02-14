@@ -69,9 +69,6 @@ def fetch_product_from_google(barcode: str):
 def openFoodAPI_fetch(barcode: str):
     url = "https://world.openfoodfacts.net/api/v2/product/{barcode}.json?product_type=food&knowledge_panels_excluded=enviroment_card"
 
-    headers = {
-        Authorization: "Basic " + btoa("off:off") 
-    }
 
     try:
         response = requests.get(url)
