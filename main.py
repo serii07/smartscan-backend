@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from services import fetch_product_from_google, openFoodAPI_fetch
+from parse_additives import parse_additives
 
 app = FastAPI()
 
@@ -38,6 +39,10 @@ def analyze_product(request: BarcodeRequest):
                 f"&format=jpg"
             )
 
+        ingredients_text = food_data.get("ingredients") if food_data else None
+        additives = parse_additives(ingredients_text) if ingredients_text else []
+        print(f"Additives found: {len(additives)}")
+
         final_response = {
             "barcode": request.barcode,
             "product_name": google_data.get("product_name") if google_data else None,
@@ -51,6 +56,9 @@ def analyze_product(request: BarcodeRequest):
             "nutriments": food_data.get("nutriments") if food_data else None,
             "nova_group": food_data.get("nova_group") if food_data else None,
             "allergens": food_data.get("allergens") if food_data else None,
+
+            #additives
+            "additives": additives,
         }
 
 
