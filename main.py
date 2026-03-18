@@ -3,21 +3,15 @@ from pydantic import BaseModel
 from typing import List, Optional
 from services import fetch_product_from_google, openFoodAPI_fetch
 from parse_additives import parse_additives
-from ai import evaluate_product
+from ai_eval import evaluate_product
 
 app = FastAPI()
-
-
-class UserPreferences(BaseModel):
-    restrictions: Optional[List[str]] = []
-    allergens:    Optional[List[str]] = []
-    goals:        Optional[List[str]] = []
 
 
 class BarcodeRequest(BaseModel):
     barcode:      str
     barcode_type: Optional[str] = None
-    user_prefs:   Optional[UserPreferences] = None
+    # user_prefs: Optional[UserPreferences] = None  # TODO: wire up when profile screen built
 
 
 @app.get("/")
@@ -51,20 +45,13 @@ def analyze_product(request: BarcodeRequest):
 
         ai_result = None
         if food_data:
-            user_prefs_dict = {}
-            if request.user_prefs:
-                user_prefs_dict = {
-                    "restrictions": request.user_prefs.restrictions or [],
-                    "allergens":    request.user_prefs.allergens    or [],
-                    "goals":        request.user_prefs.goals        or [],
-                }
             ai_result = evaluate_product(
                 ingredients     = ingredients_text,
                 nutriments      = food_data.get("nutriments"),
                 additives       = additives,
                 nutrition_grade = food_data.get("nutrition_grade"),
                 nova_group      = food_data.get("nova_group"),
-                user_prefs      = user_prefs_dict
+                user_prefs      = {}   # empty until profile screen is built
             )
             print(f"AI result: {ai_result}")
 
@@ -73,16 +60,21 @@ def analyze_product(request: BarcodeRequest):
             "product_name":      google_data.get("product_name") if google_data else None,
             "image_url":         google_data.get("image_url")    if google_data else None,
             "barcode_image_url": barcode_image_url,
+            # OFF data
             "ingredients":       ingredients_text,
             "nutrition_grade":   food_data.get("nutrition_grade")  if food_data else None,
             "nutriscore_data":   food_data.get("nutriscore_data")  if food_data else None,
             "nutriments":        food_data.get("nutriments")       if food_data else None,
             "nova_group":        food_data.get("nova_group")       if food_data else None,
             "allergens":         food_data.get("allergens")        if food_data else None,
+            # Additives
             "additives":         additives,
+            # AI fields
             "recommendation":    ai_result.get("recommendation") if ai_result else None,
             "ai_evaluation":     ai_result.get("evaluation")     if ai_result else None,
             "carcinogenic":      ai_result.get("carcinogenic")   if ai_result else False,
+            "ai_allergens":      ai_result.get("allergens")      if ai_result else [],
+            "diet":              ai_result.get("diet")           if ai_result else None,
         }
 
     except Exception as e:
