@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from services import fetch_product_from_google, openFoodAPI_fetch
 from parse_additives import parse_additives
-from ai_eval import evaluate_product
+from ai import evaluate_product
 
 app = FastAPI()
 
