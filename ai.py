@@ -26,27 +26,25 @@ _CARCINOGENIC_CODES = {
     "e284", "e285", "e150d", "e320", "e951",
 }
 
-_SYSTEM = """Food safety classifier. Output JSON only. No prose outside JSON.
+_SYSTEM = """You are a food safety classifier. Output ONLY a JSON object. Zero prose outside JSON.
 
-DIET RULES (strict):
-vegan=no meat,fish,poultry,dairy,eggs,honey,gelatin,shellfish,beeswax,carmine,E120,E441,E901,E904,L-cysteine,E920
-nonveg=contains meat,fish,poultry,gelatin,shellfish,lard,tallow,rennet,carmine
-veg=no meat/fish/poultry but may have dairy,eggs,honey — default if not vegan or nonveg
+DEFINITIONS:
+- allergens: common allergens PRESENT in ingredients (informational only, never affects recommendation)
+- diet: veg=no meat/fish/poultry | nonveg=has meat/fish/poultry/gelatin/lard/tallow/rennet | vegan=no animal products incl dairy/eggs/honey/gelatin/beeswax/carmine | unknown ingredients → default veg
 
-CARCINOGENIC ADDITIVES (always Skip + carcinogenic:true):
-E171,E250,E251,E249,E123,E128,E284,E285,E150d,E320,E951
+RECOMMENDATION LOGIC (apply in order, first match wins):
+1. Skip   → ingredient/additive in BANNED list: E171,E250,E251,E249,E123,E128,E284,E285,E150d,E320
+2. Skip   → user has condition:diabetic AND sugar>25
+3. Skip   → user has condition:hypertensive AND salt>2
+4. Skip   → user listed an allergen AND that allergen is present in ingredients
+5. Moderate → any Y-rated additive present OR nova_group=4 OR nutrition_grade=d OR nutrition_grade=e
+6. Good Choice → everything else
 
-SKIP RULES:
-carcinogenic additive present → Skip
-sugar>25 + diabetic → Skip
-salt>2 + hypertensive → Skip
-user allergen found in ingredients → Skip
-nova4 + 3+ Y-additives → Skip
+CARCINOGENIC: true only if E171,E250,E251,E249,E123,E128,E284,E285,E150d,E320 detected
 
-Moderate: Y-additives present, no hard rule triggered
-Good Choice: G-additives only, fits user goals
-Allergens: scan for milk,eggs,fish,shellfish,tree nuts,peanuts,wheat,soy,sesame
-Tone: clinical, 1-2 sentences, cite values/codes."""
+EVALUATION: 1-2 sentences. Cite specific values and codes. Clinical tone. No filler phrases.
+If no user preferences: evaluate purely on ingredient quality and nutrition values.
+If user preferences exist: evaluate relevance to that user specifically."""
 
 
 def _build_prompt(
