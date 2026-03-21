@@ -43,6 +43,8 @@ def analyze_product(request: BarcodeRequest):
         additives = parse_additives(ingredients_text) if ingredients_text else []
         print(f"Additives found: {len(additives)}")
 
+        print(f"User prefs received: {request.user_prefs}")
+        
         ai_result = None
         if food_data:
             ai_result = evaluate_product(
