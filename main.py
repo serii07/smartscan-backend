@@ -3,15 +3,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 from services import fetch_product_from_google, openFoodAPI_fetch
 from parse_additives import parse_additives
-from typing import List, Optional
 from ai import evaluate_product
 
 app = FastAPI()
+
 
 class UserPreferences(BaseModel):
     restrictions: Optional[List[str]] = []
     allergens:    Optional[List[str]] = []
     goals:        Optional[List[str]] = []
+
 
 class BarcodeRequest(BaseModel):
     barcode:      str
@@ -44,11 +45,19 @@ def analyze_product(request: BarcodeRequest):
                 f"&format=jpg"
             )
 
+        # Build user prefs dict from request
+        user_prefs_dict = {}
+        if request.user_prefs:
+            user_prefs_dict = {
+                "restrictions": request.user_prefs.restrictions or [],
+                "allergens":    request.user_prefs.allergens    or [],
+                "goals":        request.user_prefs.goals        or [],
+            }
+        print(f"User prefs received: {user_prefs_dict}")
+
         ingredients_text = food_data.get("ingredients") if food_data else None
         additives = parse_additives(ingredients_text) if ingredients_text else []
         print(f"Additives found: {len(additives)}")
-
-        print(f"User prefs received: {request.user_prefs}")
 
         ai_result = None
         if food_data:
@@ -58,7 +67,7 @@ def analyze_product(request: BarcodeRequest):
                 additives       = additives,
                 nutrition_grade = food_data.get("nutrition_grade"),
                 nova_group      = food_data.get("nova_group"),
-                user_prefs      = {}   # empty until profile screen is built
+                user_prefs      = user_prefs_dict
             )
             print(f"AI result: {ai_result}")
 
@@ -67,16 +76,13 @@ def analyze_product(request: BarcodeRequest):
             "product_name":      google_data.get("product_name") if google_data else None,
             "image_url":         google_data.get("image_url")    if google_data else None,
             "barcode_image_url": barcode_image_url,
-            # OFF data
             "ingredients":       ingredients_text,
             "nutrition_grade":   food_data.get("nutrition_grade")  if food_data else None,
             "nutriscore_data":   food_data.get("nutriscore_data")  if food_data else None,
             "nutriments":        food_data.get("nutriments")       if food_data else None,
             "nova_group":        food_data.get("nova_group")       if food_data else None,
             "allergens":         food_data.get("allergens")        if food_data else None,
-            # Additives
             "additives":         additives,
-            # AI fields
             "recommendation":    ai_result.get("recommendation") if ai_result else None,
             "ai_evaluation":     ai_result.get("evaluation")     if ai_result else None,
             "carcinogenic":      ai_result.get("carcinogenic")   if ai_result else False,
