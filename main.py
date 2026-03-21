@@ -3,15 +3,20 @@ from pydantic import BaseModel
 from typing import List, Optional
 from services import fetch_product_from_google, openFoodAPI_fetch
 from parse_additives import parse_additives
+from typing import List, Optional
 from ai import evaluate_product
 
 app = FastAPI()
 
+class UserPreferences(BaseModel):
+    restrictions: Optional[List[str]] = []
+    allergens:    Optional[List[str]] = []
+    goals:        Optional[List[str]] = []
 
 class BarcodeRequest(BaseModel):
     barcode:      str
     barcode_type: Optional[str] = None
-    # user_prefs: Optional[UserPreferences] = None  # TODO: wire up when profile screen built
+    user_prefs:   Optional[UserPreferences] = None
 
 
 @app.get("/")
@@ -44,7 +49,7 @@ def analyze_product(request: BarcodeRequest):
         print(f"Additives found: {len(additives)}")
 
         print(f"User prefs received: {request.user_prefs}")
-        
+
         ai_result = None
         if food_data:
             ai_result = evaluate_product(
