@@ -232,35 +232,38 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
 
 
 def _submit_to_off_background(
-    barcode: str,
-    product_name: Optional[str],
-    scan_type: str,
+    barcode:          str,
+    product_name:     Optional[str],
+    scan_type:        str,
     parsed_data,
-    existing_data: Optional[dict]
+    existing_data:    Optional[dict],
+    image_url:        Optional[str] = None,  # ← NEW: from Google search
 ):
     """Background task — runs after response is sent to client."""
     try:
         nutriments       = parsed_data if scan_type == 'nutrition'   else None
         ingredients_text = parsed_data if scan_type == 'ingredients' else None
-
-        # Merge with existing data if available
+ 
         if existing_data:
             if not nutriments:
                 nutriments = existing_data.get('nutriments')
             if not ingredients_text:
                 ingredients_text = existing_data.get('ingredients')
-
+            if not image_url:
+                image_url = existing_data.get('image_url')
+ 
         result = submit_product_to_off(
             barcode          = barcode,
             product_name     = product_name,
             nutriments       = nutriments,
-            ingredients_text = ingredients_text
+            ingredients_text = ingredients_text,
+            image_url        = image_url,    # ← NEW: passed through
         )
         print(f"OFF submission: {result}")
     except Exception as e:
         print(f"OFF background submission failed: {e}")
-
-
+ 
+ 
 # ── Fuzzy search endpoint ─────────────────────────────────────────────────────
 
 @app.post("/fuzzy-search")
@@ -329,7 +332,8 @@ def submit_product(request: ProductSubmitRequest, background_tasks: BackgroundTa
             nutriments       = request.nutriments,
             ingredients_text = request.ingredients_text,
             brands           = request.brands,
-            quantity         = request.quantity
+            quantity         = request.quantity,
+            image_url        = (request.existing_data or {}).get('image_url')
         )
         return {"success": True, "message": "Product data received and queued for submission"}
     except Exception as e:
