@@ -917,7 +917,6 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
             "raw_text": raw_text,
             "warnings": warnings
         }
-        logger.warning("PARSER: unknown scan_type=%s", scan_type)
     else:
         return {
             "scan_type": scan_type,
