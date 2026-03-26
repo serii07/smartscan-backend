@@ -118,8 +118,11 @@ def _round_nutriments(nutriments: dict) -> dict:
 
 
 def openFoodAPI_fetch(barcode: str):
+    # Use world.openfoodfacts.org (production). The .net domain is a staging
+    # mirror — data submitted via the write API goes to .org and may take
+    # hours or never appear on .net, which broke the post-OCR rescan flow.
     url = (
-        f"https://world.openfoodfacts.net/api/v2/product/{barcode}"
+        f"https://world.openfoodfacts.org/api/v2/product/{barcode}"
         "?fields=product_name,"
         "nutrition_grades,"
         "nutriscore_data,"
@@ -144,6 +147,7 @@ def openFoodAPI_fetch(barcode: str):
         raw_nutriments = product.get("nutriments")
 
         return {
+            "product_name": product.get("product_name"),   # Issue 4: expose for name fallback
             "ingredients": product.get("ingredients_text"),
             "nutrition_grade": product.get("nutrition_grades"),
             "nutriscore_data": product.get("nutriscore_data"),

@@ -69,6 +69,15 @@ def analyze_product(request: BarcodeRequest):
                 "barcode": request.barcode
             }
 
+        # Issue 4: Google search is the preferred name source (clean, human-readable).
+        # Fall back to OFF product_name if Google returns nothing.
+        # If both are empty the Android app will show an editable name field.
+        product_name = None
+        if google_data:
+            product_name = google_data.get("product_name")
+        if not product_name and food_data:
+            product_name = food_data.get("product_name")
+
         barcode_image_url = None
         if request.barcode_type:
             barcode_image_url = (
@@ -108,7 +117,7 @@ def analyze_product(request: BarcodeRequest):
 
         return {
             "barcode":           request.barcode,
-            "product_name":      google_data.get("product_name") if google_data else None,
+            "product_name":      product_name,   # may be from Google or OFF or None
             "image_url":         google_data.get("image_url")    if google_data else None,
             "barcode_image_url": barcode_image_url,
             "ingredients":       ingredients_text,
