@@ -19,6 +19,9 @@ Key challenges addressed:
 import re
 from typing import Optional
 from difflib import SequenceMatcher
+import logging
+
+logger = logging.getLogger("smartscan.ocr_parser")
 
 
 # ── OCR error correction ──────────────────────────────────────────────────────
@@ -845,6 +848,7 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
     }
     """
     warnings = []
+    logger.info("PARSER: start scan_type=%s raw_len=%s", scan_type, len(raw_text or ""))
 
     if not raw_text or len(raw_text.strip()) < 10:
         return {
@@ -857,7 +861,9 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
         }
 
     if scan_type == 'nutrition':
+        logger.info("PARSER: nutrition branch entered")
         nutriments = parse_nutrition_label(raw_text)
+        logger.info("PARSER: nutrition parsed keys=%s", list(nutriments.keys()))
 
         # Confidence: based on how many key nutrients we found
         key_nutrients = ['energy-kcal_100g', 'proteins_100g', 'carbohydrates_100g',
@@ -874,6 +880,8 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
         if 'energy-kcal_100g' not in nutriments:
             warnings.append("Energy value not detected.")
 
+
+        logger.info("PARSER: nutrition confidence=%.2f success=%s", confidence, confidence > 0.2)
         return {
             "scan_type": "nutrition",
             "success": confidence > 0.2,
@@ -884,7 +892,9 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
         }
 
     elif scan_type == 'ingredients':
+        logger.info("PARSER: ingredients branch entered")
         ingredients_text = parse_ingredients_label(raw_text)
+        logger.info("PARSER: ingredients parsed len=%s", len(ingredients_text or ""))
 
         # Confidence: based on whether we found actual ingredient-like content
         has_commas     = ',' in ingredients_text
@@ -898,7 +908,7 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
                 "No comma-separated ingredients detected. "
                 "The scan may not be pointed at an ingredients list."
             )
-
+        logger.info("PARSER: ingredients confidence=%.2f success=%s", confidence, confidence > 0.3)
         return {
             "scan_type": "ingredients",
             "success": confidence > 0.3,
@@ -907,7 +917,7 @@ def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
             "raw_text": raw_text,
             "warnings": warnings
         }
-
+        logger.warning("PARSER: unknown scan_type=%s", scan_type)
     else:
         return {
             "scan_type": scan_type,
