@@ -43,8 +43,7 @@ def extract_text_from_image(image_base64: str) -> Optional[str]:
         )
 
         print(f"VISION: response received status={response.status_code}", flush=True)
-        print("VISION RESPONSE BODY:", response.text, flush=True)  # ← ADD THIS LINE
-
+        print(f"VISION: response size={len(response.text)} chars", flush=True)
         response.raise_for_status()
         data = response.json()
 
