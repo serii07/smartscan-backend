@@ -62,21 +62,15 @@ def analyze_product(request: BarcodeRequest):
         google_data = fetch_product_from_google(request.barcode)
         food_data   = openFoodAPI_fetch(request.barcode)
 
+        print(f"Google data: {'found' if google_data else 'None'}")
+        print(f"OFF data:    {'found' if food_data else 'None'}")
+
         if not google_data and not food_data:
             return {
                 "error": "Product not found",
                 "missing_data": True,
                 "barcode": request.barcode
             }
-
-        # Issue 4: Google search is the preferred name source (clean, human-readable).
-        # Fall back to OFF product_name if Google returns nothing.
-        # If both are empty the Android app will show an editable name field.
-        product_name = None
-        if google_data:
-            product_name = google_data.get("product_name")
-        if not product_name and food_data:
-            product_name = food_data.get("product_name")
 
         barcode_image_url = None
         if request.barcode_type:
@@ -96,15 +90,25 @@ def analyze_product(request: BarcodeRequest):
             }
         print(f"User prefs: {user_prefs_dict}")
 
+        # Product name: Google is preferred (cleaner), OFF is the fallback.
+        product_name = (google_data or {}).get("product_name") or                        (food_data  or {}).get("product_name") or None
+        print(f"Product name resolved: '{product_name}'")
+
         ingredients_text = food_data.get("ingredients") if food_data else None
         additives = parse_additives(ingredients_text) if ingredients_text else []
 
-        # Determine what data is missing — tell the Android app
-        missing_nutrition    = not food_data or not food_data.get("nutriments")
-        missing_ingredients  = not food_data or not food_data.get("ingredients")
+        # Missing-data flags — used by Android to show blur CTAs.
+        # Check for the four key nutrient fields specifically; OFF can return
+        # a non-empty nutriments dict that only contains irrelevant derived keys.
+        _KEY_NUTRIENTS = {"energy-kcal_100g", "proteins_100g", "carbohydrates_100g", "fat_100g"}
+        raw_nutriments = food_data.get("nutriments") if food_data else None
+        has_key_nutrients = bool(raw_nutriments and any(k in raw_nutriments for k in _KEY_NUTRIENTS))
+        missing_nutrition   = not has_key_nutrients
+        missing_ingredients = not food_data or not food_data.get("ingredients")
+        print(f"missing_nutrition={missing_nutrition} missing_ingredients={missing_ingredients}")
 
         ai_result = None
-        if food_data and (ingredients_text or food_data.get("nutriments")):
+        if food_data and (ingredients_text or has_key_nutrients):
             ai_result = evaluate_product(
                 ingredients     = ingredients_text,
                 nutriments      = food_data.get("nutriments") if food_data else None,
@@ -114,11 +118,13 @@ def analyze_product(request: BarcodeRequest):
                 user_prefs      = user_prefs_dict
             )
             print(f"AI result: {ai_result}")
+        else:
+            print("AI skipped: insufficient data (no ingredients and no key nutrients)")
 
         return {
             "barcode":           request.barcode,
-            "product_name":      product_name,   # may be from Google or OFF or None
-            "image_url":         google_data.get("image_url")    if google_data else None,
+            "product_name":      product_name,
+            "image_url":         google_data.get("image_url") if google_data else None,
             "barcode_image_url": barcode_image_url,
             "ingredients":       ingredients_text,
             "nutrition_grade":   food_data.get("nutrition_grade")  if food_data else None,
