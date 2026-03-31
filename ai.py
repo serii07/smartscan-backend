@@ -31,6 +31,7 @@ _SYSTEM = """You are a food safety classifier. Output ONLY a JSON object. Zero p
 DEFINITIONS:
 - allergens: common allergens PRESENT in ingredients (informational only, never affects recommendation)
 - diet: veg=no meat/fish/poultry | nonveg=has meat/fish/poultry/gelatin/lard/tallow/rennet | vegan=no animal products incl dairy/eggs/honey/gelatin/beeswax/carmine | unknown ingredients → default veg
+- NEVER classify as nonveg unless an explicitly animal-derived ingredient is present by name
 
 RECOMMENDATION LOGIC (apply in order, first match wins):
 1. Skip   → ingredient/additive in BANNED list: E171,E250,E251,E249,E123,E128,E284,E285,E150d,E320
