@@ -1,86 +1,67 @@
-"""ocr_parser.py
+"""
+ocr_parser.py
+The core parsing engine. Takes raw OCR text from Vision API and produces
+structured, normalized nutrition data and ingredients.
 
-Revised OCR parsing pipeline for nutrition labels and ingredients.
-
-Design goals:
-- Use Vision OCR only as the text engine.
-- Reconstruct table structure from coordinates.
-- Prefer line/column geometry over raw flattened text.
-- Validate values with nutrient rules and confidence scoring.
-- Keep ingredients parsing simpler and safer.
-- Fall back to text-only parsing when structured OCR is unavailable.
-- Dual-parse: if structured confidence is low, try text-only and take the better result.
-
-Expected OCR input:
-- Google Vision full response dict (preferred), or
-- raw OCR text string (fallback compatibility).
-
-Main entrypoint:
-- process_ocr_scan(raw_ocr, scan_type)
-
-Output schema:
-{
-    "scan_type": "nutrition" | "ingredients",
-    "success": bool,
-    "data": dict | str | None,
-    "confidence": float,
-    "raw_text": str,
-    "warnings": list[str]
-}
+Key challenges addressed:
+1. OCR character substitution errors (l→1, O→0, rn→m, etc.)
+2. Non-standardized FSSAI label formats
+3. Per-serving vs per-100g conversion  ← FIX: column-index-aware, not global guess
+4. Unit normalization (kJ→kcal, mg→g) ← FIX: unit inferred from field name too
+5. Hindi/transliterated field names
+6. Percentage RDA columns (we extract absolute values only) ← FIX: column detection
+7. Malformed numbers (e.g. "25.7g" "25 7g" "25,7" all mean 25.7)
+8. Ingredient tokenization preserving parenthetical sub-ingredients
+9. Non-nutritional metadata lines filtered out  ← FIX: expanded skip patterns
+10. Tabular fallback fires when < 3 nutrients found, not just on empty dict ← FIX
 """
 
-from __future__ import annotations
-
-import logging
-import math
 import re
-from dataclasses import dataclass
+from typing import Optional
 from difflib import SequenceMatcher
-from statistics import median
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import logging
 
 logger = logging.getLogger("smartscan.ocr_parser")
 
-# ---------------------------------------------------------------------------
-# OCR corrections
-# ---------------------------------------------------------------------------
+
+# ── OCR error correction ──────────────────────────────────────────────────────
+# Map common OCR character substitutions in nutrition label context
 
 OCR_CORRECTIONS = {
     # Numeric confusions
-    r"\bO\b": "0",
-    r"\bl\b": "1",
-    r"(?<=\d)O(?=\D|$)": "0",
-    r"(?<=\d)l(?=\D|$)": "1",
-    r"(?<=\d)I(?=\D|$)": "1",
-    r"(?<=\d)S(?=\D|$)": "5",
-    r",(?=\d{1,2}\b)": ".",
+    r'\bO\b': '0',           # standalone O → 0
+    r'\bl\b': '1',           # standalone l → 1
+    r'(?<=\d)O(?=\D|$)': '0',  # digit+O → digit+0
+    r'(?<=\d)l(?=\D|$)': '1',  # digit+l → digit+1
+    r'(?<=\d)I(?=\D|$)': '1',  # digit+I → digit+1
+    r'(?<=\d)S(?=\D|$)': '5',  # digit+S → digit+5 (rare but happens)
+    r',(?=\d{1,2}\b)': '.',  # European decimal comma → dot (e.g. 25,7 → 25.7)
 
-    # Common label OCR mistakes
-    r"Proteln\b": "Protein",
-    r"Protem\b": "Protein",
-    r"Carbohydrotes\b": "Carbohydrates",
-    r"Carbohydrales\b": "Carbohydrates",
-    r"Sodlum\b": "Sodium",
-    r"Calclum\b": "Calcium",
-    r"Calones\b": "Calories",
-    r"Eneray\b": "Energy",
-    r"Saturoled\b": "Saturated",
-    r"Monounsaturoted\b": "Monounsaturated",
-    r"Polyunsaturoted\b": "Polyunsaturated",
-    r"\bFots\b": "Fats",
-    r"\bFat s\b": "Fats",
-    r"Dietory\b": "Dietary",
-    r"Flbre\b": "Fibre",
-    r"\bFlber\b": "Fiber",
-    r"Vltomin\b": "Vitamin",
-    r"Mlnerols\b": "Minerals",
-    r"Tronsfatty\b": "Trans fatty",
-    r"Trens\b": "Trans",
+    # Common word OCR errors on nutrition labels
+    r'Proteln\b': 'Protein',
+    r'Protem\b': 'Protein',
+    r'Carbohydrotes\b': 'Carbohydrates',
+    r'Carbohydrales\b': 'Carbohydrates',
+    r'Sodlum\b': 'Sodium',
+    r'Calclum\b': 'Calcium',
+    r'Calones\b': 'Calories',
+    r'Eneray\b': 'Energy',
+    r'Saturoled\b': 'Saturated',
+    r'Monounsaturoted\b': 'Monounsaturated',
+    r'Polyunsaturoted\b': 'Polyunsaturated',
+    r'\bFots\b': 'Fats',
+    r'\bFat s\b': 'Fats',
+    r'Dietory\b': 'Dietary',
+    r'Flbre\b': 'Fibre',
+    r'\bFlber\b': 'Fiber',
+    r'Vltomin\b': 'Vitamin',
+    r'Mlnerols\b': 'Minerals',
+    r'Tronsfatty\b': 'Trans fatty',
+    r'Trens\b': 'Trans',
 }
 
-# ---------------------------------------------------------------------------
-# Nutrient aliases
-# ---------------------------------------------------------------------------
+# ── Nutrient field name aliases ───────────────────────────────────────────────
+# Maps every known variant (including Hindi transliterations) → canonical key
 
 NUTRIENT_ALIASES = {
     # Energy
@@ -93,7 +74,7 @@ NUTRIENT_ALIASES = {
     "kcal": "energy_kcal",
     "energy (kcal)": "energy_kcal",
     "energy kcal": "energy_kcal",
-    "urja": "energy_kcal",
+    "urja": "energy_kcal",          # Hindi: ऊर्जा
     "urja (kcal)": "energy_kcal",
 
     # Energy kJ
@@ -107,8 +88,8 @@ NUTRIENT_ALIASES = {
     "total protein": "proteins_100g",
     "crude protein": "proteins_100g",
     "protein content": "proteins_100g",
-    "proteen": "proteins_100g",
-    "pranin": "proteins_100g",
+    "proteen": "proteins_100g",      # transliteration variant
+    "pranin": "proteins_100g",       # Hindi: प्रोटीन
 
     # Carbohydrates
     "carbohydrate": "carbohydrates_100g",
@@ -128,7 +109,7 @@ NUTRIENT_ALIASES = {
     "total sugars": "sugars_100g",
     "of which sugars": "sugars_100g",
     "of which: sugars": "sugars_100g",
-    "chini": "sugars_100g",
+    "chini": "sugars_100g",          # Hindi: चीनी
     "added sugar": "sugars_100g",
     "added sugars": "sugars_100g",
 
@@ -139,7 +120,7 @@ NUTRIENT_ALIASES = {
     "total fats": "fat_100g",
     "fat content": "fat_100g",
     "lipids": "fat_100g",
-    "vasa": "fat_100g",
+    "vasa": "fat_100g",              # Hindi: वसा
 
     # Saturated fat
     "saturated fat": "saturated-fat_100g",
@@ -157,7 +138,7 @@ NUTRIENT_ALIASES = {
     "trans fatty acids": "trans-fat_100g",
     "of which trans": "trans-fat_100g",
 
-    # Fibre / fiber
+    # Fibre
     "dietary fibre": "fiber_100g",
     "dietary fiber": "fiber_100g",
     "fibre": "fiber_100g",
@@ -166,17 +147,17 @@ NUTRIENT_ALIASES = {
     "total dietary fiber": "fiber_100g",
     "roughage": "fiber_100g",
 
-    # Sodium / salt
+    # Sodium / Salt
     "sodium": "sodium_100g",
     "salt": "salt_100g",
     "salt equivalent": "salt_100g",
-    "namak": "salt_100g",
+    "namak": "salt_100g",            # Hindi: नमक
 
     # Cholesterol
     "cholesterol": "cholesterol_100g",
     "total cholesterol": "cholesterol_100g",
 
-    # Other nutrients
+    # Minor nutrients (stored but not displayed in main table)
     "calcium": "calcium_100g",
     "iron": "iron_100g",
     "vitamin c": "vitamin-c_100g",
@@ -187,1087 +168,686 @@ NUTRIENT_ALIASES = {
     "zinc": "zinc_100g",
 }
 
-# ---------------------------------------------------------------------------
-# Constants / regex patterns
-# ---------------------------------------------------------------------------
-
+# ── Unit conversion constants ─────────────────────────────────────────────────
 KJ_TO_KCAL = 0.239006
-MG_TO_G = 0.001
-MCG_TO_G = 0.000001
+MG_TO_G    = 0.001
+MCG_TO_G   = 0.000001
 
-MIN_NUTRIENTS_THRESHOLD = 3
-KEY_NUTRIENTS = [
-    "energy-kcal_100g",
-    "proteins_100g",
-    "carbohydrates_100g",
-    "fat_100g",
-    "sugars_100g",
-]
-
-# FIX: Removed `r"contains?\s+added"` (catches "Added Sugar" rows),
-#      `r"\*+\s*\w"`, and `r"†\s*\w"` (too broad, could skip valid rows).
-#      Made `contains?` standalone so "contains added sugar" is NOT blocked.
+# ── FIX #4: Non-nutritional line skip pattern ─────────────────────────────────
+# Expanded set of metadata lines that must never be parsed as nutrient rows.
 NON_NUTRITIONAL_SKIP = re.compile(
-    r"^("
-    r"nutrients?|nutrition\s+facts?|nutrition\s+info(rmation)?"
-    r"|per\s+100|per\s+serving|per\s+portion|amount\s+per"
-    r"|typical\s+values?|as\s+sold|as\s+prepared|as\s+consumed"
-    r"|servings?\s+per\s+(pack|container|box|pouch|tin|bottle|can)"
-    r"|number\s+of\s+servings?"
-    r"|serving\s+size|portion\s+size|serve\s+size"
-    r"|%\s*(rda|ri|dv|daily\s+value)|rda\s*%|%\s*ri"
-    r"|fssai\s+(lic|license|reg|no|licen)"
-    r"|mfg\.?|mfd\.?|mkd\.?|packed\s+by|manufactured\s+by|mkt\.?\s+by"
-    r"|best\s+before|expiry|use\s+by|exp\.?"
-    r"|store\s+in|storage|keep\s+refrigerated|keep\s+cool"
-    r"|country\s+of\s+origin"
-    r"|batch|lot\s+no|lic\.?\s*no|b\.?\s*no"
-    r"|directions?\s+for\s+use|how\s+to\s+use"
-    r"|%\s+daily\s+values?\s+are\s+based"
-    r"|daily\s+values?\s+are\s+based"
-    r")",
-    re.IGNORECASE,
+    r'^('
+    r'nutrients?|nutrition\s+facts?|nutrition\s+info(rmation)?'
+    r'|per\s+100|per\s+serving|per\s+portion|amount\s+per'
+    r'|typical\s+values?|as\s+sold|as\s+prepared|as\s+consumed'
+    r'|servings?\s+per\s+(pack|container|box|pouch|tin|bottle|can)'
+    r'|number\s+of\s+servings?'
+    r'|serving\s+size|portion\s+size|serve\s+size'
+    r'|%\s*(rda|ri|dv|daily\s+value)|rda\s*%|%\s*ri'
+    r'|fssai\s+(lic|license|reg|no|licen)'
+    r'|mfg\.?|mfd\.?|mkd\.?|packed\s+by|manufactured\s+by|mkt\.?\s+by'
+    r'|best\s+before|expiry|use\s+by|exp\.?'
+    r'|store\s+in|storage|keep\s+refrigerated|keep\s+cool'
+    r'|country\s+of\s+origin'
+    r'|batch|lot\s+no|lic\.?\s*no|b\.?\s*no'
+    r'|directions?\s+for\s+use|how\s+to\s+use'
+    r'|contains?\s+added'                 # "Contains added vitamins" type lines
+    r'|\*+\s*\w'                          # footnote lines starting with *
+    r'|†\s*\w'                            # footnote lines starting with †
+    r')',
+    re.IGNORECASE
 )
 
-HEADER_HINT_RE = re.compile(
-    r"(per\s*100\s*(g|gm|ml)|/\s*100\s*(g|gm|ml)|per\s*(serving|portion|serve)|%\s*(rda|ri|dv)|rda)",
-    re.IGNORECASE,
-)
 
-START_INGREDIENT_PATTERNS = [
-    r"ingredients?\s*[:\-]",
-    r"^ingredients?\b",   # NEW: handles "INGREDIENTS" without colon
-    r"composition\s*[:\-]",
-    r"made\s+from\s*[:\-]",
-    r"contains?\s*[:\-]",
-    r"manufactured\s+from\s*[:\-]",
-    r"saamagri\s*[:\-]",
-]
-
-END_INGREDIENT_PATTERNS = [
-    r"allergen\s+information",
-    r"allergy\s+advice",
-    r"contains?\s+allergen",
-    r"nutritional\s+information",
-    r"nutrition\s+facts",
-    r"best\s+before",
-    r"manufactured\s+by",
-    r"packed\s+by",
-    r"fssai\s+lic",
-    r"mkd\s+by",
-    r"mfd\s+by",
-    r"country\s+of\s+origin",
-    r"net\s+(wt|weight|qty|quantity)",
-    r"storage\s+instructions",
-    r"directions\s+for\s+use",
-]
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OCRToken:
-    text: str
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-    cx: float
-    cy: float
-    line_hint: int = -1
-
-    @property
-    def w(self) -> float:
-        return max(0.0, self.x1 - self.x0)
-
-    @property
-    def h(self) -> float:
-        return max(0.0, self.y1 - self.y0)
-
-
-# ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
-
-
-def _apply_ocr_corrections(text: str) -> str:
+def _correct_ocr_errors(text: str) -> str:
+    """Apply character-level and word-level OCR corrections."""
     for pattern, replacement in OCR_CORRECTIONS.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
 
 
-def _strip_noise(text: str) -> str:
-    text = text.replace("\u200b", " ")
-    text = re.sub(r"\r", "", text)                 # strip carriage returns
-    text = re.sub(r"[ \t]+", " ", text)            # collapse horizontal whitespace only
-    text = re.sub(r"\n{3,}", "\n\n", text)         # max 2 consecutive blank lines
-    return text.strip()
-
-
-def _is_numeric_like(text: str) -> bool:
-    return bool(re.search(r"\d", text))
-
-
-def _contains_percentage_only(text: str) -> bool:
-    t = text.strip()
-    return bool(re.fullmatch(r"[<>≤≥~\s\d.,]+\s*%", t))
-
-
-# FIX: New helper — distinguishes pure value tokens from label tokens that
-#      happen to contain digits (e.g., "Vitamin B12", "E471").
-def _is_value_like(text: str) -> bool:
-    """Return True if text looks like a standalone numeric value (not an alphanumeric label)."""
-    t = text.strip()
-    return bool(re.fullmatch(
-        r"[<>≤≥~≈]?\s*[\d][\d,.\s]*\s*(g|mg|mcg|μg|ug|kcal|kj|ml|%|iu)?",
-        t,
-        re.IGNORECASE,
-    ))
-
-
-def _flatten_ocr_payload(raw_ocr: Union[str, dict, None]) -> str:
-    if raw_ocr is None:
-        return ""
-
-    if isinstance(raw_ocr, str):
-        return raw_ocr
-
-    if not isinstance(raw_ocr, dict):
-        return str(raw_ocr)
-
-    full = raw_ocr.get("fullTextAnnotation", {}) if isinstance(raw_ocr, dict) else {}
-    text = full.get("text", "") if isinstance(full, dict) else ""
-    if text:
-        return text
-
-    # Fallback: reconstruct text from words
-    tokens = _vision_payload_to_tokens(raw_ocr)
-    if not tokens:
-        return ""
-
-    lines = _cluster_tokens_into_lines(tokens)
-    return "\n".join(_line_to_text(line) for line in lines)
-
-
-def _safe_float(value: Optional[float], default: float = 0.0) -> float:
-    return default if value is None or math.isnan(value) else float(value)
-
-
-# ---------------------------------------------------------------------------
-# Vision response parsing
-# ---------------------------------------------------------------------------
-
-
-def _vision_payload_to_tokens(payload: dict) -> List[OCRToken]:
-    """Extract OCR tokens with boxes from a Google Vision full response."""
-    tokens: List[OCRToken] = []
-
-    if not isinstance(payload, dict):
-        return tokens
-
-    pages = payload.get("fullTextAnnotation", {}).get("pages", [])
-    if not pages:
-        return tokens
-
-    for page_idx, page in enumerate(pages):
-        blocks = page.get("blocks", []) or []
-        for block in blocks:
-            paragraphs = block.get("paragraphs", []) or []
-            for para in paragraphs:
-                words = para.get("words", []) or []
-                for word in words:
-                    symbols = word.get("symbols", []) or []
-                    text = "".join(sym.get("text", "") for sym in symbols).strip()
-                    if not text:
-                        continue
-
-                    box = word.get("boundingBox", {}).get("vertices", []) or []
-                    if len(box) < 4:
-                        continue
-
-                    xs = [float(v.get("x", 0.0)) for v in box]
-                    ys = [float(v.get("y", 0.0)) for v in box]
-                    x0, x1 = min(xs), max(xs)
-                    y0, y1 = min(ys), max(ys)
-                    cx = (x0 + x1) / 2.0
-                    cy = (y0 + y1) / 2.0
-
-                    tokens.append(
-                        OCRToken(
-                            text=text,
-                            x0=x0,
-                            y0=y0,
-                            x1=x1,
-                            y1=y1,
-                            cx=cx,
-                            cy=cy,
-                            line_hint=page_idx,
-                        )
-                    )
-
-    return tokens
-
-
-# ---------------------------------------------------------------------------
-# Layout reconstruction
-# ---------------------------------------------------------------------------
-
-
-def _cluster_tokens_into_lines(tokens: Sequence[OCRToken]) -> List[List[OCRToken]]:
-    if not tokens:
-        return []
-
-    ordered = sorted(tokens, key=lambda t: (t.cy, t.cx))
-    heights = [t.h for t in ordered if t.h > 0]
-    # FIX: use a slightly more generous tolerance to handle skewed labels
-    y_tolerance = max(8.0, (median(heights) * 0.70) if heights else 12.0)
-
-    lines: List[List[OCRToken]] = []
-    line_centers: List[float] = []
-
-    for tok in ordered:
-        placed = False
-        for i, center in enumerate(line_centers):
-            if abs(tok.cy - center) <= y_tolerance:
-                lines[i].append(tok)
-                new_center = sum(t.cy for t in lines[i]) / len(lines[i])
-                line_centers[i] = new_center
-                placed = True
-                break
-        if not placed:
-            lines.append([tok])
-            line_centers.append(tok.cy)
-
-    for line in lines:
-        line.sort(key=lambda t: t.cx)
-
-    # Merge tiny adjacent lines that are very close together
-    merged: List[List[OCRToken]] = []
-    for line in sorted(lines, key=lambda ln: sum(t.cy for t in ln) / len(ln)):
-        if not merged:
-            merged.append(line)
-            continue
-        prev = merged[-1]
-        prev_y = sum(t.cy for t in prev) / len(prev)
-        cur_y = sum(t.cy for t in line) / len(line)
-        prev_h = median([t.h for t in prev if t.h > 0]) if prev else 0
-        cur_h = median([t.h for t in line if t.h > 0]) if line else 0
-        merge_gap = max(6.0, min(prev_h, cur_h) * 0.50 if prev_h and cur_h else 6.0)
-        if abs(cur_y - prev_y) <= merge_gap:
-            merged[-1] = sorted(prev + line, key=lambda t: t.cx)
-        else:
-            merged.append(line)
-
-    return merged
-
-
-def _line_to_text(line: Sequence[OCRToken]) -> str:
-    return " ".join(tok.text for tok in line).strip()
-
-
-def _line_bounds(line: Sequence[OCRToken]) -> Tuple[float, float, float, float]:
-    x0 = min(t.x0 for t in line)
-    y0 = min(t.y0 for t in line)
-    x1 = max(t.x1 for t in line)
-    y1 = max(t.y1 for t in line)
-    return x0, y0, x1, y1
-
-
-def _line_cy(line: Sequence[OCRToken]) -> float:
-    return sum(t.cy for t in line) / max(len(line), 1)
-
-
-def _split_line_into_segments(line: Sequence[OCRToken]) -> List[List[OCRToken]]:
-    if not line:
-        return []
-
-    ordered = sorted(line, key=lambda t: t.x0)
-    widths = [t.w for t in ordered if t.w > 0]
-    median_width = median(widths) if widths else 18.0
-    # FIX: slightly narrower default gap to avoid over-splitting
-    gap_threshold = max(15.0, median_width * 1.65)
-
-    segments: List[List[OCRToken]] = [[ordered[0]]]
-    for prev, cur in zip(ordered, ordered[1:]):
-        gap = cur.x0 - prev.x1
-        if gap > gap_threshold:
-            segments.append([cur])
-        else:
-            segments[-1].append(cur)
-    return segments
-
-
-def _segment_text(seg: Sequence[OCRToken]) -> str:
-    return " ".join(tok.text for tok in seg).strip()
-
-
-def _segment_has_digits(seg: Sequence[OCRToken]) -> bool:
-    return any(_is_numeric_like(tok.text) for tok in seg)
-
-
-def _segment_cx(seg: Sequence[OCRToken]) -> float:
-    return sum(t.cx for t in seg) / len(seg)
-
-
-def _cluster_1d(values: Sequence[float], threshold: float = 40.0) -> List[float]:
-    sorted_vals = sorted(v for v in values if v is not None)
-    if not sorted_vals:
-        return []
-
-    clusters: List[List[float]] = [[sorted_vals[0]]]
-    for v in sorted_vals[1:]:
-        if abs(v - clusters[-1][-1]) > threshold:
-            clusters.append([v])
-        else:
-            clusters[-1].append(v)
-    return [sum(c) / len(c) for c in clusters]
-
-
-# ---------------------------------------------------------------------------
-# Text normalization / matching
-# ---------------------------------------------------------------------------
-
-
-def _normalize_text_for_match(text: str) -> str:
-    text = _apply_ocr_corrections(text)
-    text = text.lower().strip()
-    text = re.sub(r"[\*†‡#]", "", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[:\-–]+$", "", text).strip()
-    text = re.sub(r"\(.*?\)", "", text).strip()
-    text = re.sub(r"\b(g|mg|mcg|μg|ug|kcal|kj|ml|%)\b", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 def _fuzzy_match_nutrient(raw_field: str) -> Optional[str]:
-    if not raw_field or not raw_field.strip():
-        return None
+    """
+    Find the best matching canonical nutrient key for a raw field name.
+    Uses exact match first, then normalized match, then fuzzy similarity.
+    Returns None if no match above confidence threshold.
+    """
+    normalized = raw_field.lower().strip()
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = re.sub(r'[*†‡#]', '', normalized)
+    normalized = normalized.rstrip(':').strip()
 
-    normalized = _normalize_text_for_match(raw_field)
-    if not normalized:
-        return None
-
-    # Direct match
+    # Exact match
     if normalized in NUTRIENT_ALIASES:
         return NUTRIENT_ALIASES[normalized]
 
-    # Without parenthesised units
-    no_paren = re.sub(r"\(.*?\)", "", normalized).strip()
+    # Try without parenthetical content: "Energy (kcal)" → "energy"
+    no_paren = re.sub(r'\(.*?\)', '', normalized).strip()
     if no_paren in NUTRIENT_ALIASES:
         return NUTRIENT_ALIASES[no_paren]
 
-    # Without units
-    no_units = re.sub(r"\b(g|mg|mcg|μg|ug|kcal|kj|ml|%)\b", "", normalized).strip()
+    # Try removing units if they crept into the field name
+    no_units = re.sub(r'\b(g|mg|mcg|kcal|kj|ml|%)\b', '', normalized).strip()
     if no_units in NUTRIENT_ALIASES:
         return NUTRIENT_ALIASES[no_units]
 
-    # FIX: Lower threshold for key nutrients, normal for others.
+    # Fuzzy match — only accept if similarity > 0.82
     best_score = 0.0
-    best_key: Optional[str] = None
+    best_key   = None
     for alias, canonical in NUTRIENT_ALIASES.items():
         score = SequenceMatcher(None, normalized, alias).ratio()
         if score > best_score:
             best_score = score
-            best_key = canonical
+            best_key   = canonical
 
-    # FIX: Use 0.78 instead of 0.82 — catches more OCR distortions while
-    #      still filtering noise. Key nutrients get a slightly lower bar.
-    threshold = 0.78
-    if best_key in ("energy_kcal", "proteins_100g", "carbohydrates_100g", "fat_100g"):
-        threshold = 0.72
+    if best_score >= 0.82:
+        return best_key
 
-    return best_key if best_score >= threshold else None
-
-
-# ---------------------------------------------------------------------------
-# Numeric parsing / unit conversion
-# ---------------------------------------------------------------------------
+    return None
 
 
 def _parse_numeric_value(raw: str) -> Optional[float]:
+    """
+    Extract a numeric value from messy OCR output.
+    Handles: "25.7g", "< 0.5", "Nil", "Trace", "25 7" (OCR space), "N/A"
+    """
     raw = raw.strip()
 
-    if re.match(r"^(nil|none|trace|n\.?a\.?|not detected|nd|-)$", raw, re.IGNORECASE):
+    # Nil / Trace / N/A → 0.0
+    if re.match(r'^(nil|none|trace|n\.?a\.?|not detected|nd|-)$', raw, re.IGNORECASE):
         return 0.0
 
-    # FIX: was r"^[<>≤≥~≈]\\s*" (double backslash = literal \s, not whitespace)
-    raw = re.sub(r"^[<>≤≥~≈]\s*", "", raw)
-    raw = re.sub(r"\s*(g|mg|mcg|μg|ug|kcal|kj|kJ|ml|%|iu|IU)\s*$", "", raw, flags=re.IGNORECASE)
+    # Less than / greater than prefix — take the value as-is
+    raw = re.sub(r'^[<>≤≥~approx\.]+\s*', '', raw)
 
-    # Fix OCR space-as-decimal: "25 7" → "25.7"
-    raw = re.sub(r"(\d+)\s+(\d{1,2})$", r"\1.\2", raw)
+    # Remove unit suffixes
+    raw = re.sub(r'\s*(g|mg|mcg|μg|kcal|kj|kJ|ml|%|iu|IU)\s*$', '', raw, flags=re.IGNORECASE)
 
-    cleaned = re.sub(r"[^\d.]", "", raw)
-    if not cleaned:
-        return None
+    # OCR sometimes puts spaces in numbers: "25 7" → "25.7" (if < 10 second part)
+    raw = re.sub(r'(\d+)\s+(\d{1,2})$', r'\1.\2', raw)
 
-    parts = cleaned.split(".")
+    # Remove all non-numeric except dot
+    cleaned = re.sub(r'[^\d.]', '', raw)
+
+    # Handle multiple dots (OCR artifact)
+    parts = cleaned.split('.')
     if len(parts) > 2:
-        cleaned = parts[0] + "." + "".join(parts[1:])
+        cleaned = parts[0] + '.' + ''.join(parts[1:])
 
     try:
-        return float(cleaned)
+        return float(cleaned) if cleaned else None
     except ValueError:
         return None
 
 
-def _extract_numeric_value_and_unit(text: str) -> Tuple[Optional[float], str]:
-    """Return the first numeric value and attached unit from a token/segment."""
-    text = text.strip()
-    text = _apply_ocr_corrections(text)
-
-    # FIX: Changed [\s\d.,]+ to [\d.,]+ to avoid greedily absorbing
-    #      whitespace and swallowing the next token's value.
-    m = re.search(
-        r"([<>≤≥~≈]?\s*[\d][\d,.]*)\s*(g|mg|mcg|μg|ug|kcal|kj|kJ|ml|%|iu|IU)?",
-        text,
-        re.IGNORECASE,
-    )
-    if not m:
-        return None, ""
-
-    value = _parse_numeric_value(m.group(1))
-    unit = (m.group(2) or "").lower().strip()
-    return value, unit
-
-
-def _infer_unit_from_field(raw_field: str) -> str:
-    m = re.search(r"\(\s*(g|mg|mcg|μg|ug|kcal|kj|ml|iu)\s*\)", raw_field, re.IGNORECASE)
-    if m:
-        return m.group(1).lower()
-
-    m = re.search(r"\b(mg|mcg|μg|ug|kcal|kj)\b", raw_field, re.IGNORECASE)
-    if m:
-        return m.group(1).lower()
-
-    return ""
-
-
-def _convert_units(value: float, unit: str, canonical_key: str) -> float:
-    unit = unit.lower().strip() if unit else ""
-
-    if canonical_key == "energy_kj" or unit == "kj":
-        return round(value * KJ_TO_KCAL, 2)
-
-    if unit in ("mg", "milligrams", "milligram"):
-        return round(value * MG_TO_G, 6)
-
-    if unit in ("mcg", "μg", "ug", "micrograms", "microgram"):
-        return round(value * MCG_TO_G, 8)
-
-    return value
-
-
-def _normalize_to_per_100g(value: float, serving_g: Optional[float]) -> float:
-    if serving_g and serving_g > 0:
-        return round((value / serving_g) * 100.0, 2)
-    return value
-
-
-# ---------------------------------------------------------------------------
-# Column / layout detection
-# ---------------------------------------------------------------------------
-
-
-def _detect_header_roles(lines: Sequence[Sequence[OCRToken]]) -> Dict[str, float]:
-    """Infer which visual column corresponds to which role.
-
-    FIX: Now returns Dict[str, float] mapping role → x-center coordinate
-    instead of role → segment index. Segment indices don't generalise
-    across different lines with different segment counts.
+def _extract_serving_size(text: str) -> Optional[float]:
     """
-    roles: Dict[str, float] = {}
-
-    for line in lines[:15]:
-        segments = _split_line_into_segments(line)
-        for seg in segments:
-            seg_text = _segment_text(seg)
-            norm = seg_text.lower().strip()
-            role = None
-
-            if re.search(r"per\s*100\s*(g|gm|ml)|/\s*100\s*(g|gm|ml)|values?\s*per\s*100", norm):
-                role = "per_100g"
-            elif re.search(r"per\s*(serving|portion|serve|pack|sachet|piece|unit|biscuit)", norm):
-                role = "per_serving"
-            elif re.search(r"%\s*(rda|ri|dv)|rda\b", norm):
-                role = "rda"
-
-            # First occurrence wins; do not overwrite with a later hit.
-            if role and role not in roles:
-                roles[role] = _segment_cx(seg)
-
-    return roles
-
-
-def _detect_numeric_column_anchors(lines: Sequence[Sequence[OCRToken]]) -> List[float]:
-    """Cluster x-positions of numeric value columns.
-
-    FIX: Uses _is_value_like() to exclude alphanumeric label tokens
-    (e.g. "Vitamin B12", "E471") from the anchor pool, which previously
-    skewed the leftmost cluster toward the label column.
+    Extract the serving size in grams from the label text.
+    Needed to normalize per-serving values to per-100g.
     """
-    xs: List[float] = []
-
-    for line in lines[:20]:
-        segments = _split_line_into_segments(line)
-        for seg in segments:
-            seg_text = _segment_text(seg)
-            if _is_value_like(seg_text) or _contains_percentage_only(seg_text):
-                xs.append(_segment_cx(seg))
-
-    # Also include positions inferred from column header text
-    for line in lines[:12]:
-        text = _line_to_text(line)
-        if HEADER_HINT_RE.search(text):
-            segments = _split_line_into_segments(line)
-            for seg in segments:
-                seg_text = _segment_text(seg)
-                if HEADER_HINT_RE.search(seg_text):
-                    xs.append(_segment_cx(seg))
-
-    if not xs:
-        return []
-
-    spread = max(xs) - min(xs) if len(xs) > 1 else 0
-    threshold = max(25.0, min(70.0, spread / 6.0 if spread else 40.0))
-    return _cluster_1d(xs, threshold=threshold)
-
-
-# ---------------------------------------------------------------------------
-# Nutrition parsing
-# ---------------------------------------------------------------------------
-
-
-def _extract_serving_size_from_text(text: str) -> Optional[float]:
     patterns = [
-        r"serving\s+size\s*[:\-]?\s*([\d.]+)\s*g",
-        r"per\s+serving\s*[:\-]?\s*([\d.]+)\s*g",
-        r"per\s+portion\s*[:\-]?\s*([\d.]+)\s*g",
-        r"([\d.]+)\s*g\s+per\s+serving",
-        r"serve\s+size\s*[:\-]?\s*([\d.]+)\s*g",
-        r"portion\s+size\s*[:\-]?\s*([\d.]+)\s*g",
-        r"per\s+([\d.]+)\s*g\b",
+        r'serving\s+size\s*[:\-]?\s*([\d.]+)\s*g',
+        r'per\s+serving\s*[:\-]?\s*([\d.]+)\s*g',
+        r'per\s+portion\s*[:\-]?\s*([\d.]+)\s*g',
+        r'([\d.]+)\s*g\s+per\s+serving',
+        r'serve\s+size\s*[:\-]?\s*([\d.]+)\s*g',
+        r'portion\s+size\s*[:\-]?\s*([\d.]+)\s*g',
+        r'per\s+([\d.]+)\s*g\b',
     ]
     for pattern in patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            value = _parse_numeric_value(m.group(1))
-            if value is not None and 5 <= value <= 500:
-                return value
+            val = _parse_numeric_value(m.group(1))
+            if val and 5 <= val <= 500:   # sanity check
+                return val
     return None
 
 
-def _choose_numeric_candidate(
-    candidates: List[Tuple[float, str, float]],
-    anchors: Sequence[float],
-    role_x_map: Dict[str, float],
-) -> Optional[Tuple[float, str, float]]:
-    """Pick the best numeric candidate for the per-100g column.
-
-    FIX: Accepts role_x_map (Dict[str, float] → role to x-coordinate) instead
-    of per100g_idx (a segment index that does not generalise across rows).
-    Selects by spatial proximity to the known per-100g column x-position.
+def _detect_per_unit(text: str) -> str:
     """
-    if not candidates:
-        return None
+    Determine if the table shows values per 100g or per serving.
+    Returns 'per_100g' or 'per_serving'.
 
-    non_pct = [(v, u, x) for v, u, x in candidates if u != "%"]
-    if not non_pct:
-        # Only % values found — not useful
-        return None
-
-    per100g_x = role_x_map.get("per_100g")
-    per_serving_x = role_x_map.get("per_serving")
-
-    if per100g_x is not None:
-        # Sort by proximity to the known per-100g column x-position
-        sorted_cands = sorted(non_pct, key=lambda c: abs(c[2] - per100g_x))
-        best = sorted_cands[0]
-
-        # Guard: make sure we didn't accidentally pick the per-serving column
-        if per_serving_x is not None:
-            if abs(best[2] - per_serving_x) < abs(best[2] - per100g_x):
-                # The closest candidate is nearer to the serving column
-                # Try to find one that is definitely closer to per-100g
-                per100g_cands = [
-                    c for c in non_pct
-                    if abs(c[2] - per100g_x) < abs(c[2] - per_serving_x)
-                ]
-                if per100g_cands:
-                    return min(per100g_cands, key=lambda c: abs(c[2] - per100g_x))
-                # If none qualify, return the leftmost non-% value as fallback
-                return min(non_pct, key=lambda c: c[2])
-
-        return best
-
-    if anchors:
-        # No role map: treat the leftmost numeric anchor as the per-100g column
-        leftmost = min(anchors)
-        return min(non_pct, key=lambda c: abs(c[2] - leftmost))
-
-    # No structural info at all: return the leftmost non-% value
-    return min(non_pct, key=lambda c: c[2])
-
-
-def _row_candidates_from_line(line: Sequence[OCRToken]) -> List[Tuple[float, str, float]]:
-    candidates: List[Tuple[float, str, float]] = []
-    for tok in line:
-        if not _is_value_like(tok.text):
-            continue
-        value, unit = _extract_numeric_value_and_unit(tok.text)
-        if value is None:
-            continue
-        candidates.append((value, unit, tok.cx))
-    return candidates
-
-
-def _parse_nutrition_structured(
-    lines: Sequence[Sequence[OCRToken]],
-    raw_text: str,
-) -> Tuple[Dict[str, float], List[str], float]:
-    nutriments: Dict[str, float] = {}
-    warnings: List[str] = []
-    parsed_rows = 0
-    matched_rows = 0
-
-    role_x_map = _detect_header_roles(lines)        # FIX: Dict[str, float]
-    anchors = _detect_numeric_column_anchors(lines)
-    serving_size = _extract_serving_size_from_text(raw_text)
-
-    explicit_per_serving = "per_serving" in role_x_map
-    explicit_rda = "rda" in role_x_map
-
-    # FIX: pending stores (canonical, raw_field, y_center) so we can guard
-    #      against the label bleeding across unrelated rows far away.
-    all_heights = [t.h for line in lines for t in line if t.h > 0]
-    median_line_h = median(all_heights) if all_heights else 12.0
-    max_pending_y_gap = max(median_line_h * 5.0, 45.0)
-
-    pending: Optional[Tuple[str, str, float]] = None  # (canonical, raw_field, y_center)
-
-    for line in lines:
-        line_text = _line_to_text(line)
-        norm_text = _normalize_text_for_match(line_text)
-        cur_y = _line_cy(line)
-
-        if not norm_text:
-            continue
-
-        if NON_NUTRITIONAL_SKIP.match(norm_text):
-            continue
-
-        # Ignore pure header rows (no digits)
-        if HEADER_HINT_RE.search(norm_text) and not _is_numeric_like(norm_text):
-            continue
-
-        # FIX: Only skip purely numeric lines when there is NO pending label.
-        #      This is the key fix for stacked/vertical value layouts where
-        #      the label and value appear on separate lines.
-        is_purely_numeric = bool(re.fullmatch(r"[\d\s.,%]+", norm_text))
-        if is_purely_numeric:
-            if pending is None:
-                continue
-
-        parsed_rows += 1
-
-        # Find the index of the first numeric token in the line
-        first_numeric_idx = None
-        for idx, tok in enumerate(line):
-            if _is_numeric_like(tok.text):
-                first_numeric_idx = idx
-                break
-
-        # ── Label-only line (no numeric content) ──────────────────────────
-        if first_numeric_idx is None:
-            canonical = _fuzzy_match_nutrient(line_text)
-            if canonical:
-                pending = (canonical, line_text, cur_y)
-            else:
-                pending = None
-            continue
-
-        # ── Line has at least one numeric token ───────────────────────────
-        label_tokens = line[:first_numeric_idx]
-        value_tokens = line[first_numeric_idx:]
-        raw_field = _line_to_text(label_tokens).strip().rstrip(":–-")
-
-        canonical = _fuzzy_match_nutrient(raw_field)
-
-        if not canonical and pending is not None:
-            pend_canonical, pend_raw, pend_y = pending
-            # FIX: Consume pending label only when the current line is
-            #      within a reasonable Y-distance of the label line.
-            if abs(cur_y - pend_y) <= max_pending_y_gap:
-                canonical = pend_canonical
-                raw_field = pend_raw
-            pending = None
-        else:
-            pending = None  # Fresh label found; discard stale pending
-
-        if not canonical:
-            continue
-
-        candidates = _row_candidates_from_line(value_tokens)
-        if not candidates:
-            # No values on this line yet — keep as pending in case the value
-            # is on the very next line (stacked layout)
-            pending = (canonical, raw_field, cur_y)
-            continue
-
-        chosen = _choose_numeric_candidate(candidates, anchors, role_x_map)
-        if chosen is None:
-            pending = (canonical, raw_field, cur_y)
-            continue
-
-        raw_value, raw_unit, raw_x = chosen
-
-        if raw_unit == "%":
-            non_pct = [c for c in candidates if c[1] != "%"]
-            if non_pct:
-                raw_value, raw_unit, raw_x = non_pct[0]
-            else:
-                continue
-
-        if not raw_unit:
-            raw_unit = _infer_unit_from_field(raw_field)
-
-        value = _convert_units(raw_value, raw_unit, canonical)
-
-        if serving_size and explicit_per_serving and not explicit_rda and "per_100g" not in role_x_map:
-            if canonical not in ("energy_kj",):
-                value = _normalize_to_per_100g(value, serving_size)
-
-        # FIX: Rename energy keys BEFORE inserting into nutriments so that
-        #      KEY_NUTRIENTS matching in _nutrition_confidence works correctly.
-        if canonical in ("energy_kj", "energy_kcal"):
-            canonical = "energy-kcal_100g"
-
-        if canonical == "sodium_100g":
-            nutriments["sodium_100g"] = round(value, 3)
-            nutriments["salt_100g"] = round(value * 2.5, 3)
-            matched_rows += 1
-            continue
-
-        if canonical not in nutriments:
-            nutriments[canonical] = round(value, 2)
-        elif not isinstance(nutriments[canonical], (int, float)):
-            nutriments[canonical] = round(value, 2)
-
-        matched_rows += 1
-
-    if len(nutriments) < MIN_NUTRIENTS_THRESHOLD:
-        warnings.append(
-            "Fewer than 3 nutrients found from structured parsing; "
-            "label may be partial or badly cropped."
-        )
-
-    confidence = _nutrition_confidence(
-        nutriments, parsed_rows, matched_rows, role_x_map, anchors
-    )
-    return nutriments, warnings, confidence
-
-
-def _parse_nutrition_text_only(raw_text: str) -> Tuple[Dict[str, float], List[str], float]:
-    """Fallback for legacy OCR output that only contains flattened text."""
-    nutriments: Dict[str, float] = {}
-    warnings: List[str] = []
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    serving_size = _extract_serving_size_from_text(raw_text)
-    per_unit = _detect_per_unit_text(raw_text)   # FIX: removed dead per100g_col_idx
-
-    for line in lines:
-        norm = _normalize_text_for_match(line)
-        if NON_NUTRITIONAL_SKIP.match(norm):
-            continue
-        if re.fullmatch(r"[\d\s.,%]+", norm):
-            continue
-
-        first_digit = re.search(r"[<>≤≥~≈]?\d", line)
-        if not first_digit:
-            continue
-
-        raw_field = line[: first_digit.start()].strip().rstrip(":–-")
-        canonical = _fuzzy_match_nutrient(raw_field)
-        if not canonical:
-            continue
-
-        values_part = line[first_digit.start():]
-        candidates: List[Tuple[float, str, float]] = []
-        for match in re.finditer(
-            r"([<>≤≥~≈]?\s*[\d][\d,.]*)\s*(g|mg|mcg|μg|ug|kcal|kj|kJ|ml|%|iu|IU)?",
-            values_part,
-            re.IGNORECASE,
-        ):
-            value = _parse_numeric_value(match.group(1))
-            if value is None:
-                continue
-            unit = (match.group(2) or "").lower().strip()
-            candidates.append((value, unit, float(match.start())))
-
-        # In text-only mode we have no x-coordinates; role_x_map is empty.
-        chosen = _choose_numeric_candidate(candidates, [], {})
-        if chosen is None:
-            continue
-
-        raw_value, raw_unit, _ = chosen
-        if not raw_unit:
-            raw_unit = _infer_unit_from_field(raw_field)
-
-        value = _convert_units(raw_value, raw_unit, canonical)
-
-        # FIX: Only normalise to per-100g when we explicitly detected per-serving
-        if per_unit == "per_serving" and serving_size and canonical not in ("energy_kj",):
-            value = _normalize_to_per_100g(value, serving_size)
-
-        if canonical in ("energy_kj", "energy_kcal"):
-            canonical = "energy-kcal_100g"
-
-        if canonical == "sodium_100g":
-            nutriments["sodium_100g"] = round(value, 3)
-            nutriments["salt_100g"] = round(value * 2.5, 3)
-        else:
-            if canonical not in nutriments:
-                nutriments[canonical] = round(value, 2)
-
-    if len(nutriments) < MIN_NUTRIENTS_THRESHOLD:
-        warnings.append(
-            "Text-only parsing found too few nutrients; structured OCR would be more reliable."
-        )
-
-    confidence = _nutrition_confidence(nutriments, len(lines), len(nutriments), {}, [])
-    return nutriments, warnings, confidence
-
-
-def _detect_per_unit_text(text: str) -> str:
+    NOTE: This is a coarse fallback used only when column-index detection
+    cannot be applied (e.g. inline key-value format with a single column).
+    For multi-column tables use _detect_per100g_column_index() instead.
+    """
     text_lower = text.lower()
 
     per_100g_signals = [
-        "per 100 g", "per 100g", "per100g", "/100g", "/100 g",
-        "per 100 ml", "per 100ml", "per 100 gm", "values per 100",
+        'per 100 g', 'per 100g', 'per100g',
+        '/100g', '/100 g', 'per 100 ml', 'per 100ml',
+        'per 100 gm', 'values per 100'
     ]
     per_serving_signals = [
-        "per serving", "per portion", "per serve", "per pack",
-        "per packet", "per sachet", "per biscuit", "per piece", "per unit",
+        'per serving', 'per portion', 'per serve',
+        'per pack', 'per packet', 'per sachet',
+        'per biscuit', 'per piece', 'per unit'
     ]
 
-    first_100g = min(
-        (text_lower.find(s) for s in per_100g_signals if s in text_lower),
-        default=9999,
+    # Check which appears first — usually the primary column header
+    first_100g    = min((text_lower.find(s) for s in per_100g_signals   if s in text_lower), default=9999)
+    first_serving = min((text_lower.find(s) for s in per_serving_signals if s in text_lower), default=9999)
+
+    if first_100g <= first_serving:
+        return 'per_100g'
+    return 'per_serving'
+
+
+# ── FIX #1 & #2: Column-index-aware per-100g detection ───────────────────────
+
+def _detect_per100g_column_index(lines: list) -> int:
+    """
+    Scan the first 20 lines for a column header row and determine which
+    0-based numeric column index corresponds to per-100g values.
+
+    Indian labels typically have columns in one of these orders:
+        [per serving]  [per 100g]  [%RDA]   → index 1
+        [per 100g]     [per serving]  [%RDA] → index 0
+        [per 100g]     [%RDA]         → index 0
+
+    Falls back to 0 (first numeric column) if undetectable.
+    """
+    per_100g_re  = re.compile(
+        r'per\s*100\s*(g|ml|gm)|/\s*100\s*(g|ml)|values?\s*per\s*100',
+        re.IGNORECASE
     )
-    first_serving = min(
-        (text_lower.find(s) for s in per_serving_signals if s in text_lower),
-        default=9999,
+    per_serv_re  = re.compile(
+        r'per\s*(serving|portion|serve|pack|sachet|piece|unit|biscuit)',
+        re.IGNORECASE
     )
+    rda_re = re.compile(r'%\s*(rda|ri|dv)|rda', re.IGNORECASE)
 
-    # FIX: Return "unknown" when neither signal is present, rather than
-    #      defaulting to "per_serving" and incorrectly normalising values.
-    if first_100g == 9999 and first_serving == 9999:
-        return "unknown"
+    for line in lines[:20]:
+        hits = []
+        for label, pattern in [('serving', per_serv_re), ('100g', per_100g_re), ('rda', rda_re)]:
+            m = pattern.search(line)
+            if m:
+                hits.append((label, m.start()))
 
-    return "per_100g" if first_100g <= first_serving else "per_serving"
+        if not hits:
+            continue
+
+        # Need at least 2 column headers on the same line to determine order
+        if len(hits) >= 2:
+            hits.sort(key=lambda x: x[1])   # sort by character position in line
+            for idx, (label, _) in enumerate(hits):
+                if label == '100g':
+                    return idx  # 0 = first numeric col, 1 = second, etc.
+
+        # Only per_100g found alone on this header line — it's the only column
+        if any(label == '100g' for label, _ in hits):
+            return 0
+
+    return 0   # safe default: always take the first numeric value
 
 
-# ---------------------------------------------------------------------------
-# Nutrition post-processing / confidence
-# ---------------------------------------------------------------------------
+def _extract_numeric_columns(values_part: str) -> list:
+    """
+    Extract all (value, unit) pairs from the numeric portion of a line.
+    Each match represents one table column.
+
+    E.g. "5.2 g    2.6 g    10%" → [(5.2, 'g'), (2.6, 'g'), (10.0, '%')]
+
+    Returns a list of (float, str) tuples.
+    """
+    col_pattern = re.compile(
+        r'([<>≤≥~]?\s*[\d,.]+(?:\s\d{1,2})?)'    # number (optional OCR-space decimal)
+        r'\s*(g|mg|mcg|μg|kcal|kj|kJ|ml|%|iu|IU)?',  # optional unit
+        re.IGNORECASE
+    )
+    results = []
+    for m in col_pattern.finditer(values_part):
+        raw_num  = m.group(1)
+        raw_unit = m.group(2) or ''
+        val = _parse_numeric_value(raw_num)
+        if val is not None:
+            results.append((val, raw_unit.lower().strip()))
+    return results
 
 
-def _sanity_check_nutriments(nutriments: Dict[str, float]) -> Dict[str, float]:
+# ── FIX #5: Unit inference from field name ────────────────────────────────────
+
+def _infer_unit_from_field(raw_field: str) -> str:
+    """
+    When the regex finds no unit after the numeric value, check if the
+    unit was embedded in the field name instead.
+
+    Handles patterns like:
+        "Sodium (mg)"        → 'mg'
+        "Calcium(mcg)"       → 'mcg'
+        "Energy (kJ)"        → 'kj'
+        "Protein g:"         → 'g'   (less common but seen on some labels)
+    """
+    # Parenthetical unit: "Sodium (mg)", "Energy (kJ)"
+    m = re.search(r'\(\s*(g|mg|mcg|μg|kcal|kj|ml|iu)\s*\)', raw_field, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+
+    # Unit as a standalone word at the end of the field name (no parens)
+    # Only match mg/mcg/kj here — bare 'g' is too ambiguous
+    m = re.search(r'\b(mg|mcg|μg|kcal|kj)\b', raw_field, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+
+    return ''
+
+
+def _normalize_to_per_100g(value: float, unit: str, serving_g: Optional[float]) -> float:
+    """Convert a per-serving value to per-100g."""
+    if serving_g and serving_g > 0:
+        value_per_g = value / serving_g
+        return round(value_per_g * 100, 2)
+    return value
+
+
+def _convert_units(value: float, unit: str, canonical_key: str) -> float:
+    """
+    Convert all values to standard units:
+    - Energy: always store as kcal (convert from kJ if needed)
+    - Minerals: always store as g (convert from mg/mcg)
+    """
+    unit = unit.lower().strip() if unit else ''
+
+    if canonical_key == 'energy_kj' or unit == 'kj':
+        return round(value * KJ_TO_KCAL, 2)
+
+    if unit in ('mg', 'milligrams', 'milligram'):
+        return round(value * MG_TO_G, 4)
+
+    if unit in ('mcg', 'μg', 'micrograms', 'microgram', 'ug'):
+        return round(value * MCG_TO_G, 6)
+
+    return value
+
+
+def parse_nutrition_label(raw_text: str) -> dict:
+    """
+    Main nutrition label parser.
+    Takes raw OCR text, returns a structured nutriments dict
+    matching the same schema as OpenFoodFacts API responses.
+
+    Output keys use OFF naming convention:
+        energy-kcal_100g, proteins_100g, carbohydrates_100g,
+        sugars_100g, fat_100g, saturated-fat_100g, fiber_100g,
+        sodium_100g, salt_100g, etc.
+
+    Fix summary applied here:
+        #1 & #2 — column-index-aware value extraction (multi-column support)
+        #3      — tabular fallback fires when < 3 nutrients found
+        #4      — NON_NUTRITIONAL_SKIP filters metadata lines
+        #5      — unit inferred from field name when not found after value
+    """
+    text  = _correct_ocr_errors(raw_text)
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+    # Global per-unit context (used only for single-column inline labels)
+    per_unit     = _detect_per_unit(text)
+    serving_size = _extract_serving_size(text) if per_unit == 'per_serving' else None
+
+    # FIX #1 & #2: Determine which numeric column holds per-100g values
+    per100g_col_idx = _detect_per100g_column_index(lines)
+
+    nutriments = {}
+
+    # ── Strategy 1: line-by-line parsing ─────────────────────────────────────
+    # Expected formats:
+    #   "Protein    5.2 g    2.6 g    10%"   (multi-column table)
+    #   "Energy: 100 kcal"                   (inline key-value)
+    #   "Fat (g)    4.5    2.1    8%"        (unit in field name)
+
+    for line in lines:
+
+        # FIX #4: Skip non-nutritional metadata lines
+        if NON_NUTRITIONAL_SKIP.match(line):
+            continue
+
+        # Skip lines that are only numbers (column separator rows in tables)
+        if re.match(r'^[\d\s.,%]+$', line):
+            continue
+
+        # ── Split line at the first digit to separate field name from values ──
+        first_digit = re.search(r'[<>≤≥~]?\d', line)
+        if not first_digit:
+            continue
+
+        raw_field   = line[:first_digit.start()].strip()
+        values_part = line[first_digit.start():]
+
+        # Clean trailing colon / dash from field name (inline format)
+        raw_field = raw_field.rstrip(':–-').strip()
+
+        canonical = _fuzzy_match_nutrient(raw_field)
+        if not canonical:
+            continue
+
+        # FIX #1 & #2: Extract all numeric columns, pick the right one
+        all_cols = _extract_numeric_columns(values_part)
+        if not all_cols:
+            continue
+
+        # Clamp index to available columns (label may have fewer columns than header)
+        col_idx          = min(per100g_col_idx, len(all_cols) - 1)
+        raw_value, raw_unit = all_cols[col_idx]
+
+        # FIX #5: If no unit found after the value, check if it's in the field name
+        if not raw_unit:
+            raw_unit = _infer_unit_from_field(raw_field)
+
+        # Skip RDA-only columns (unit is %) — we never want percentage values
+        if raw_unit == '%':
+            # Try adjacent columns for a real value
+            real_cols = [(v, u) for v, u in all_cols if u != '%']
+            if real_cols:
+                # Among non-% columns, pick the one at or after per100g_col_idx
+                raw_value, raw_unit = real_cols[min(per100g_col_idx, len(real_cols) - 1)]
+            else:
+                continue
+
+        # Unit conversion (kJ→kcal, mg→g)
+        value = _convert_units(raw_value, raw_unit, canonical)
+
+        # Per-serving → per-100g normalization
+        # Only apply when global context is per_serving AND we couldn't detect
+        # a dedicated per-100g column (i.e. per100g_col_idx == 0 and label is
+        # genuinely single-column per-serving)
+        if per_unit == 'per_serving' and per100g_col_idx == 0 and canonical != 'energy_kj':
+            value = _normalize_to_per_100g(value, raw_unit, serving_size)
+
+        # Remap energy keys to the single canonical OFF key
+        if canonical in ('energy_kj', 'energy_kcal'):
+            canonical = 'energy-kcal_100g'
+
+        # Sodium: also derive salt
+        if canonical == 'sodium_100g':
+            nutriments['salt_100g'] = round(value * 2.5, 3)
+            nutriments[canonical]   = round(value, 3)
+            continue
+
+        nutriments[canonical] = round(value, 2)
+
+    # ── FIX #3: Tabular fallback — fire when < 3 nutrients found, not just empty ─
+    MIN_NUTRIENTS_THRESHOLD = 3
+    if len(nutriments) < MIN_NUTRIENTS_THRESHOLD:
+        tabular_result = _parse_tabular_format(lines, per100g_col_idx)
+        # Only replace if tabular strategy found more nutrients
+        if len(tabular_result) > len(nutriments):
+            nutriments = tabular_result
+
+    # ── Post-processing ───────────────────────────────────────────────────────
+
+    # Derive salt from sodium if salt not present
+    if 'sodium_100g' in nutriments and 'salt_100g' not in nutriments:
+        nutriments['salt_100g'] = round(nutriments['sodium_100g'] * 2.5, 3)
+
+    # Sanity check: remove obviously wrong values
+    nutriments = _sanity_check_nutriments(nutriments)
+
+    return nutriments
+
+
+def _parse_tabular_format(lines: list, per100g_col_idx: int = 0) -> dict:
+    """
+    Fallback parser for tabular nutrition labels where field names and
+    values appear on separate lines or in wide columns.
+
+    Uses a two-pass approach: first collect field names, then value rows.
+    Now accepts per100g_col_idx so it picks the correct column consistently
+    with Strategy 1.
+
+    FIX #3: Now also called when Strategy 1 finds fewer than 3 nutrients.
+    FIX #1 & #2: Uses per100g_col_idx to pick the right column.
+    """
+    nutriments  = {}
+    field_names = []
+    value_groups = []
+
+    for line in lines:
+        # FIX #4: Skip metadata lines here too
+        if NON_NUTRITIONAL_SKIP.match(line):
+            continue
+
+        nums = re.findall(r'[<>~]?[\d,.]+', line)
+        if nums:
+            # Line has numbers — treat as a value row
+            vals = [_parse_numeric_value(n) for n in nums[:4]]  # max 4 columns
+            valid_vals = [v for v in vals if v is not None]
+            if valid_vals:
+                value_groups.append(valid_vals)
+            else:
+                # Numbers present but all unparseable — insert placeholder so
+                # field/value index pairing doesn't drift out of sync
+                value_groups.append([None])
+        else:
+            words = line.strip()
+            if len(words) > 2:
+                field_names.append(words)
+
+    # Pair field names with value rows (they should interleave in document order)
+    for i, field in enumerate(field_names):
+        canonical = _fuzzy_match_nutrient(field)
+        if not canonical:
+            continue
+        if i >= len(value_groups):
+            break
+
+        row = value_groups[i]
+        if row[0] is None:
+            continue
+
+        # FIX #1 & #2: Pick the correct column from this row
+        col_idx = min(per100g_col_idx, len(row) - 1)
+        val = row[col_idx]
+        if val is None:
+            continue
+
+        # FIX #5: Check field name for embedded unit
+        raw_unit = _infer_unit_from_field(field)
+
+        val = _convert_units(val, raw_unit, canonical)
+
+        if canonical in ('energy_kj', 'energy_kcal'):
+            canonical = 'energy-kcal_100g'
+
+        nutriments[canonical] = round(val, 2)
+
+    return nutriments
+
+
+def _sanity_check_nutriments(nutriments: dict) -> dict:
+    """
+    Remove values that are clearly wrong.
+    These bounds are based on physical maximums for food.
+    """
     bounds = {
-        "energy-kcal_100g": (0, 900),
-        "proteins_100g": (0, 100),
-        "carbohydrates_100g": (0, 100),
-        "sugars_100g": (0, 100),
-        "fat_100g": (0, 100),
-        "saturated-fat_100g": (0, 100),
-        "trans-fat_100g": (0, 20),
-        "fiber_100g": (0, 100),
-        "sodium_100g": (0, 40),
-        "salt_100g": (0, 100),
-        # FIX: Widened from (0, 5) g — labels often express in mg and
-        #      unit-inference may fail, leaving a higher raw value.
-        "cholesterol_100g": (0, 3.0),
+        'energy-kcal_100g':   (0, 900),    # max is pure fat ~900 kcal/100g
+        'proteins_100g':      (0, 100),
+        'carbohydrates_100g': (0, 100),
+        'sugars_100g':        (0, 100),
+        'fat_100g':           (0, 100),
+        'saturated-fat_100g': (0, 100),
+        'trans-fat_100g':     (0, 10),
+        'fiber_100g':         (0, 100),
+        'sodium_100g':        (0, 40),     # pure NaCl is ~39g sodium/100g
+        'salt_100g':          (0, 100),
+        'cholesterol_100g':   (0, 5),
     }
 
-    cleaned: Dict[str, float] = {}
+    cleaned = {}
     for key, value in nutriments.items():
         if key in bounds:
             lo, hi = bounds[key]
             if lo <= value <= hi:
                 cleaned[key] = value
             else:
-                logger.debug("Dropping out-of-range nutrient %s=%s", key, value)
+                print(f"Sanity check failed: {key}={value} (bounds {lo}–{hi}), dropping")
         else:
-            cleaned[key] = value
+            cleaned[key] = value  # keep unlisted keys as-is
 
-    # Logical consistency checks
-    if "sugars_100g" in cleaned and "carbohydrates_100g" in cleaned:
-        cleaned["sugars_100g"] = min(cleaned["sugars_100g"], cleaned["carbohydrates_100g"])
+    # Additional check: sugars <= carbs, sat fat <= fat
+    if 'sugars_100g' in cleaned and 'carbohydrates_100g' in cleaned:
+        if cleaned['sugars_100g'] > cleaned['carbohydrates_100g']:
+            cleaned['sugars_100g'] = cleaned['carbohydrates_100g']
 
-    if "saturated-fat_100g" in cleaned and "fat_100g" in cleaned:
-        cleaned["saturated-fat_100g"] = min(cleaned["saturated-fat_100g"], cleaned["fat_100g"])
-
-    if "sodium_100g" in cleaned and "salt_100g" not in cleaned:
-        cleaned["salt_100g"] = round(cleaned["sodium_100g"] * 2.5, 3)
+    if 'saturated-fat_100g' in cleaned and 'fat_100g' in cleaned:
+        if cleaned['saturated-fat_100g'] > cleaned['fat_100g']:
+            cleaned['saturated-fat_100g'] = cleaned['fat_100g']
 
     return cleaned
 
 
-def _nutrition_confidence(
-    nutriments: Dict[str, float],
-    parsed_rows: int,
-    matched_rows: int,
-    role_x_map: Dict[str, float],   # FIX: was Dict[str, int] (segment indices)
-    anchors: Sequence[float],
-) -> float:
-    key_found = sum(1 for k in KEY_NUTRIENTS if k in nutriments)
-    key_score = key_found / len(KEY_NUTRIENTS)
+# ── Ingredients parser ────────────────────────────────────────────────────────
 
-    row_score = min(1.0, matched_rows / max(1, parsed_rows))
+def parse_ingredients_label(raw_text: str) -> str:
+    """
+    Parse and clean an ingredients list from OCR text.
 
-    structure_score = 0.0
-    if anchors:
-        structure_score += 0.4
-    if role_x_map:
-        structure_score += 0.35
-    if len(nutriments) >= MIN_NUTRIENTS_THRESHOLD:
-        structure_score += 0.25
-    structure_score = min(1.0, structure_score)
+    Handles:
+    - Removing non-ingredient header text ("INGREDIENTS:", "Contains:")
+    - Preserving parenthetical sub-ingredient lists
+    - Cleaning up OCR artifacts while preserving E-numbers
+    - Normalizing separators
+    - Removing allergen declarations (these go in the allergens field)
+    - Removing percentage annotations
+    """
+    text = _correct_ocr_errors(raw_text)
 
-    confidence = (key_score * 0.45) + (row_score * 0.35) + (structure_score * 0.20)
-    return max(0.0, min(1.0, round(confidence, 3)))
-
-
-# ---------------------------------------------------------------------------
-# Ingredients parsing
-# ---------------------------------------------------------------------------
-
-
-def _extract_ingredients_block_from_text(text: str) -> str:
-    if not text:
-        return ""
-
-    start_idx = None
-    for pattern in START_INGREDIENT_PATTERNS:
+    # ── Step 1: Find where ingredients actually start ─────────────────────────
+    # Labels often have brand name, product name, etc. before ingredients
+    start_patterns = [
+        r'ingredients?\s*[:\-]',
+        r'composition\s*[:\-]',
+        r'made\s+from\s*[:\-]',
+        r'contains?\s*[:\-]',
+        r'manufactured\s+from\s*[:\-]',
+        r'saamagri\s*[:\-]',    # Hindi: सामग्री
+    ]
+    for pattern in start_patterns:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            start_idx = m.end()
+            text = text[m.end():]
             break
 
-    if start_idx is None:
-        # fallback: choose the most ingredient-like line
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if not lines:
-            return ""
-        # pick the longest comma-heavy line (best heuristic)
-        best = max(lines, key=lambda l: (l.count(','), len(l)))
-        return best
-
-    cut_text = text[start_idx:]
-
-    end_idx = len(cut_text)
-    for pattern in END_INGREDIENT_PATTERNS:
-        m = re.search(pattern, cut_text, re.IGNORECASE)
+    # ── Step 2: Find where ingredients end ───────────────────────────────────
+    end_patterns = [
+        r'allergen\s+information',
+        r'allergy\s+advice',
+        r'contains?\s+allergen',
+        r'nutritional\s+information',
+        r'nutrition\s+facts',
+        r'best\s+before',
+        r'manufactured\s+by',
+        r'packed\s+by',
+        r'fssai\s+lic',
+        r'mkd\s+by',
+        r'mfd\s+by',
+        r'country\s+of\s+origin',
+        r'net\s+(wt|weight|qty|quantity)',
+        r'storage\s+instructions',
+        r'directions\s+for\s+use',
+    ]
+    for pattern in end_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
         if m:
-            end_idx = min(end_idx, m.start())
+            text = text[:m.start()]
 
-    return cut_text[:end_idx].strip()
+    # ── Step 3: Clean up the text ─────────────────────────────────────────────
+
+    # Collapse newlines into spaces (ingredients often wrap across lines)
+    text = re.sub(r'\n+', ' ', text)
+
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
+
+    # Remove footnote markers that OCR picks up
+    text = re.sub(r'\*+[^,)]*', '', text)
+    text = re.sub(r'†[^,)]*', '', text)
+
+    # Remove percentage annotations: "(55%)" but KEEP "(E330)" and "(Acidity Regulator)"
+    text = re.sub(r'\(\s*\d+\.?\d*\s*%\s*\)', '', text)
+
+    # Remove "May contain traces of..." disclaimers mixed into ingredients
+    text = re.sub(r'may\s+contain\s+traces?\s+of[^.]*\.?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'may\s+contain\s*:?[^.]*\.?', '', text, flags=re.IGNORECASE)
+
+    # ── Step 4: Normalize separators ─────────────────────────────────────────
+    # Some labels use semicolons, some use periods between ingredients
+    text = re.sub(r';\s*', ', ', text)
+
+    # Periods followed by capital letter are likely sentence starts not separators
+    # Periods followed by lowercase or digit are likely OCR artifacts
+    text = re.sub(r'\.\s*(?=[a-z0-9])', ', ', text)
+
+    # Clean up multiple commas
+    text = re.sub(r',\s*,+', ',', text)
+    text = re.sub(r'^\s*,\s*', '', text)   # leading comma
+    text = re.sub(r',\s*$', '', text)       # trailing comma
+
+    # Final normalize
+    text = text.strip()
+
+    # Capitalize first letter of each ingredient
+    ingredients = [i.strip().capitalize() for i in text.split(',') if i.strip()]
+    return ', '.join(ingredients)
 
 
-def parse_ingredients_label(raw_ocr: Union[str, dict, None]) -> str:
-    text = _flatten_ocr_payload(raw_ocr)
-    if not text:
-        return ""
+def _fuzzy_product_name_match(query: str, candidates: list, threshold: float = 0.6) -> list:
+    """
+    Fuzzy match a query product name against a list of candidate names.
+    Returns candidates sorted by similarity score, above threshold.
 
-    text = _apply_ocr_corrections(text)
+    Used for the "Did you mean...?" flow.
+    """
+    results = []
+    query_lower = query.lower().strip()
 
-    # FIX: Preserve the line structure long enough to extract the block
-    #      correctly, then collapse only within the block.
-    block = _extract_ingredients_block_from_text(text)
-    if not block:
-        return ""
-
-    # FIX: Join lines more carefully — preserve commas at end of lines
-    #      and avoid merging mid-word line breaks.
-    lines = block.splitlines()
-    joined_parts = []
-    for line in lines:
-        line = line.strip()
-        if not line:
+    for candidate in candidates:
+        name = candidate.get('product_name', '')
+        if not name:
             continue
-        joined_parts.append(line)
 
-    text = " ".join(joined_parts)
-    text = re.sub(r"\s+", " ", text).strip()
+        name_lower = name.lower()
 
-    # Remove footnote markers and percent annotations
-    text = re.sub(r"\*+[^,)]*", "", text)
-    text = re.sub(r"†[^,)]*", "", text)
-    text = re.sub(r"\(\s*\d+\.?\d*\s*%\s*\)", "", text)
+        # Token overlap score (handles word order differences)
+        query_tokens     = set(re.findall(r'\b\w{3,}\b', query_lower))
+        candidate_tokens = set(re.findall(r'\b\w{3,}\b', name_lower))
+        if query_tokens and candidate_tokens:
+            overlap = len(query_tokens & candidate_tokens) / max(len(query_tokens), len(candidate_tokens))
+        else:
+            overlap = 0
 
-    # Remove allergen / marketing disclaimers mixed into ingredient text
-    text = re.sub(
-        r"may\s+contain\s+traces?\s+of[^.]*\.?", "", text, flags=re.IGNORECASE
-    )
-    text = re.sub(r"may\s+contain\s*:?[^.]*\.?", "", text, flags=re.IGNORECASE)
+        # String similarity
+        sim = SequenceMatcher(None, query_lower, name_lower).ratio()
 
-    # FIX: Be less aggressive with separator normalisation — avoid changing
-    #      the meaning of sub-ingredient lists wrapped in parentheses.
-    text = re.sub(r";\s*", ", ", text)
-    text = re.sub(r"\s*/\s*(?![^(]*\))", ", ", text)  # only outside parens
-    text = re.sub(r"\s*,\s*", ", ", text)
-    text = re.sub(r"\s+", " ", text).strip()
+        # Combined score (token overlap weighted higher for product names)
+        score = (overlap * 0.6) + (sim * 0.4)
 
-    # Clean leading/trailing commas
-    text = re.sub(r"^\s*,\s*", "", text)
-    text = re.sub(r",\s*$", "", text)
+        if score >= threshold:
+            results.append({**candidate, '_match_score': round(score, 3)})
 
-    return text
+    results.sort(key=lambda x: x['_match_score'], reverse=True)
+    return results[:5]   # return top 5 matches max
 
 
-def _ingredients_confidence(text: str) -> float:
-    if not text:
-        return 0.0
-    has_anchor = bool(
-        re.search(r"ingredients?|composition|made from|contains", text, re.IGNORECASE)
-    )
-    has_separators = "," in text or ";" in text
-    reasonable_len = 10 < len(text) < 5000
-    has_no_junk = not re.search(r"\b\d{6,}\b", text)
+# ── Full OCR scan processor ───────────────────────────────────────────────────
 
-    confidence = (
-        (0.35 if has_anchor else 0.0)
-        + (0.25 if has_separators else 0.0)
-        + (0.25 if reasonable_len else 0.0)
-        + (0.15 if has_no_junk else 0.0)
-    )
-    return round(min(1.0, confidence), 3)
-
-
-# ---------------------------------------------------------------------------
-# Main entrypoint
-# ---------------------------------------------------------------------------
-
-
-def parse_nutrition_label(raw_ocr: Union[str, dict, None]) -> Dict[str, float]:
-    """Compatibility wrapper that returns only the nutriments dictionary."""
-    result = process_ocr_scan(raw_ocr, "nutrition")
-    return result.get("data") or {}
-
-
-def process_ocr_scan(raw_ocr: Union[str, dict, None], scan_type: str) -> dict:
+def process_ocr_scan(raw_text: str, scan_type: str) -> dict:
     """
     Entry point called by the API endpoint.
 
     scan_type: 'nutrition' | 'ingredients'
-    """
-    warnings: List[str] = []
-    raw_text = _flatten_ocr_payload(raw_ocr)
-    raw_text = _apply_ocr_corrections(raw_text)
-    raw_text = _strip_noise(raw_text)
 
+    Returns:
+    {
+        "scan_type": "nutrition" | "ingredients",
+        "success": bool,
+        "data": dict | str,
+        "confidence": float (0–1),
+        "raw_text": str,          # for debugging
+        "warnings": list[str]
+    }
+    """
+    warnings = []
     logger.info("PARSER: start scan_type=%s raw_len=%s", scan_type, len(raw_text or ""))
 
     if not raw_text or len(raw_text.strip()) < 10:
@@ -1277,130 +857,72 @@ def process_ocr_scan(raw_ocr: Union[str, dict, None], scan_type: str) -> dict:
             "data": None,
             "confidence": 0.0,
             "raw_text": raw_text or "",
-            "warnings": ["OCR returned insufficient text. Ensure good lighting and focus."],
+            "warnings": ["OCR returned insufficient text. Ensure good lighting and camera focus."]
         }
 
-    if scan_type == "nutrition":
-        # FIX: Extract tokens once and reuse rather than calling
-        #      _vision_payload_to_tokens twice (once here, once inside
-        #      _flatten_ocr_payload if it fell back to token reconstruction).
-        structured_tokens = (
-            _vision_payload_to_tokens(raw_ocr) if isinstance(raw_ocr, dict) else []
-        )
+    if scan_type == 'nutrition':
+        logger.info("PARSER: nutrition branch entered")
+        nutriments = parse_nutrition_label(raw_text)
+        logger.info("PARSER: nutrition parsed keys=%s", list(nutriments.keys()))
 
-        if structured_tokens:
-            lines = _cluster_tokens_into_lines(structured_tokens)
-            nutriments, parse_warnings, confidence = _parse_nutrition_structured(
-                lines, raw_text
-            )
-
-            # FIX: Dual-parse fallback. If structured parse gives poor results,
-            #      also run the text-only parser and keep whichever is better.
-            if confidence < 0.40:
-                txt_nutriments, txt_warnings, txt_confidence = _parse_nutrition_text_only(
-                    raw_text
-                )
-                if txt_confidence > confidence and len(txt_nutriments) >= len(nutriments):
-                    logger.info(
-                        "PARSER: text-only (%.3f) beat structured (%.3f); using text result",
-                        txt_confidence,
-                        confidence,
-                    )
-                    nutriments, parse_warnings, confidence = (
-                        txt_nutriments,
-                        txt_warnings,
-                        txt_confidence,
-                    )
-                    parse_warnings.insert(
-                        0,
-                        "Structured parsing had low confidence; fell back to text-only mode.",
-                    )
-        else:
-            nutriments, parse_warnings, confidence = _parse_nutrition_text_only(raw_text)
-
-        warnings.extend(parse_warnings)
-        nutriments = _sanity_check_nutriments(nutriments)
+        # Confidence: based on how many key nutrients we found
+        key_nutrients = ['energy-kcal_100g', 'proteins_100g', 'carbohydrates_100g',
+                         'fat_100g', 'sugars_100g']
+        found_key  = sum(1 for k in key_nutrients if k in nutriments)
+        confidence = found_key / len(key_nutrients)
 
         if confidence < 0.4:
             warnings.append(
-                "Low confidence. The crop may include unrelated text or the nutrition "
-                "table may be partially visible."
+                "Low confidence — less than half of the key nutrients were detected. "
+                "Try rescanning with better lighting."
             )
-        if "energy-kcal_100g" not in nutriments:
+
+        if 'energy-kcal_100g' not in nutriments:
             warnings.append("Energy value not detected.")
 
-        success = confidence > 0.15 and len(nutriments) > 0
+
+        logger.info("PARSER: nutrition confidence=%.2f success=%s", confidence, confidence > 0.2)
         return {
             "scan_type": "nutrition",
-            "success": success,
+            "success": confidence > 0.2,
             "data": nutriments,
             "confidence": round(confidence, 2),
             "raw_text": raw_text,
-            "warnings": warnings,
+            "warnings": warnings
         }
 
-    if scan_type == "ingredients":
-        ingredients_text = parse_ingredients_label(raw_ocr)
-        confidence = _ingredients_confidence(ingredients_text)
+    elif scan_type == 'ingredients':
+        logger.info("PARSER: ingredients branch entered")
+        ingredients_text = parse_ingredients_label(raw_text)
+        logger.info("PARSER: ingredients parsed len=%s", len(ingredients_text or ""))
 
-        if not ingredients_text:
-            warnings.append("No ingredient text detected.")
-        if confidence < 0.35:
+        # Confidence: based on whether we found actual ingredient-like content
+        has_commas     = ',' in ingredients_text
+        reasonable_len = 10 < len(ingredients_text) < 5000
+        has_no_junk    = not re.search(r'\d{6,}', ingredients_text)  # no phone/barcode numbers
+
+        confidence = sum([has_commas, reasonable_len, has_no_junk]) / 3.0
+
+        if not has_commas:
             warnings.append(
-                "Ingredient scan confidence is low. "
-                "The crop may not be centered on the ingredient block."
+                "No comma-separated ingredients detected. "
+                "The scan may not be pointed at an ingredients list."
             )
-
+        logger.info("PARSER: ingredients confidence=%.2f success=%s", confidence, confidence > 0.3)
         return {
             "scan_type": "ingredients",
             "success": confidence > 0.3,
             "data": ingredients_text,
             "confidence": round(confidence, 2),
             "raw_text": raw_text,
-            "warnings": warnings,
+            "warnings": warnings
         }
-
-    return {
-        "scan_type": scan_type,
-        "success": False,
-        "data": None,
-        "confidence": 0.0,
-        "raw_text": raw_text,
-        "warnings": [f"Unknown scan_type: {scan_type}"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Fuzzy product name matcher (preserved for compatibility)
-# ---------------------------------------------------------------------------
-
-def _fuzzy_product_name_match(
-    query: str, candidates: list, threshold: float = 0.6
-) -> list:
-    results = []
-    query_lower = query.lower().strip()
-
-    for candidate in candidates:
-        name = candidate.get("product_name", "")
-        if not name:
-            continue
-
-        name_lower = name.lower()
-        query_tokens = set(re.findall(r"\b\w{3,}\b", query_lower))
-        candidate_tokens = set(re.findall(r"\b\w{3,}\b", name_lower))
-
-        if query_tokens and candidate_tokens:
-            overlap = len(query_tokens & candidate_tokens) / max(
-                len(query_tokens), len(candidate_tokens)
-            )
-        else:
-            overlap = 0
-
-        sim = SequenceMatcher(None, query_lower, name_lower).ratio()
-        score = (overlap * 0.6) + (sim * 0.4)
-
-        if score >= threshold:
-            results.append({**candidate, "_match_score": round(score, 3)})
-
-    results.sort(key=lambda x: x["_match_score"], reverse=True)
-    return results[:5]
+    else:
+        return {
+            "scan_type": scan_type,
+            "success": False,
+            "data": None,
+            "confidence": 0.0,
+            "raw_text": raw_text,
+            "warnings": [f"Unknown scan_type: {scan_type}"]
+        }
