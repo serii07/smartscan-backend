@@ -236,6 +236,7 @@ HEADER_HINT_RE = re.compile(
 
 START_INGREDIENT_PATTERNS = [
     r"ingredients?\s*[:\-]",
+    r"^ingredients?\b",   # NEW: handles "INGREDIENTS" without colon
     r"composition\s*[:\-]",
     r"made\s+from\s*[:\-]",
     r"contains?\s*[:\-]",
@@ -592,7 +593,7 @@ def _parse_numeric_value(raw: str) -> Optional[float]:
         return 0.0
 
     # FIX: was r"^[<>≤≥~≈]\\s*" (double backslash = literal \s, not whitespace)
-    raw = re.sub(r"^[<>≤≥~≈]\s*", "", raw)
+    raw = re.sub(r"^[<>≤≥~≈]\\s*", raw)
     raw = re.sub(r"\s*(g|mg|mcg|μg|ug|kcal|kj|kJ|ml|%|iu|IU)\s*$", "", raw, flags=re.IGNORECASE)
 
     # Fix OCR space-as-decimal: "25 7" → "25.7"
@@ -1155,7 +1156,13 @@ def _extract_ingredients_block_from_text(text: str) -> str:
             break
 
     if start_idx is None:
-        return ""
+        # fallback: choose the most ingredient-like line
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if not lines:
+            return ""
+        # pick the longest comma-heavy line (best heuristic)
+        best = max(lines, key=lambda l: (l.count(','), len(l)))
+        return best
 
     cut_text = text[start_idx:]
 
@@ -1321,7 +1328,7 @@ def process_ocr_scan(raw_ocr: Union[str, dict, None], scan_type: str) -> dict:
         if "energy-kcal_100g" not in nutriments:
             warnings.append("Energy value not detected.")
 
-        success = confidence > 0.2 and len(nutriments) > 0
+        success = confidence > 0.15 and len(nutriments) > 0
         return {
             "scan_type": "nutrition",
             "success": success,
