@@ -593,7 +593,7 @@ def _parse_numeric_value(raw: str) -> Optional[float]:
         return 0.0
 
     # FIX: was r"^[<>≤≥~≈]\\s*" (double backslash = literal \s, not whitespace)
-    raw = re.sub(r"^[<>≤≥~≈]\\s*", raw)
+    raw = re.sub(r"^[<>≤≥~≈]\s*", "", raw)
     raw = re.sub(r"\s*(g|mg|mcg|μg|ug|kcal|kj|kJ|ml|%|iu|IU)\s*$", "", raw, flags=re.IGNORECASE)
 
     # Fix OCR space-as-decimal: "25 7" → "25.7"
@@ -814,7 +814,7 @@ def _choose_numeric_candidate(
 def _row_candidates_from_line(line: Sequence[OCRToken]) -> List[Tuple[float, str, float]]:
     candidates: List[Tuple[float, str, float]] = []
     for tok in line:
-        if not _is_numeric_like(tok.text):
+        if not _is_value_like(tok.text):
             continue
         value, unit = _extract_numeric_value_and_unit(tok.text)
         if value is None:
@@ -866,8 +866,9 @@ def _parse_nutrition_structured(
         #      This is the key fix for stacked/vertical value layouts where
         #      the label and value appear on separate lines.
         is_purely_numeric = bool(re.fullmatch(r"[\d\s.,%]+", norm_text))
-        if is_purely_numeric and pending is None:
-            continue
+        if is_purely_numeric:
+            if pending is None:
+                continue
 
         parsed_rows += 1
 
