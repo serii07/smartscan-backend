@@ -1211,3 +1211,35 @@ def process_ocr_scan(raw_ocr: Union[str, dict, None], scan_type: str) -> dict:
 # ---------------------------------------------------------------------------
 # Optional helpers for debugging / review
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Fuzzy product name matcher (restored for compatibility)
+# ---------------------------------------------------------------------------
+
+def _fuzzy_product_name_match(query: str, candidates: list, threshold: float = 0.6) -> list:
+    results = []
+    query_lower = query.lower().strip()
+
+    for candidate in candidates:
+        name = candidate.get('product_name', '')
+        if not name:
+            continue
+
+        name_lower = name.lower()
+
+        query_tokens = set(re.findall(r'\b\w{3,}\b', query_lower))
+        candidate_tokens = set(re.findall(r'\b\w{3,}\b', name_lower))
+
+        if query_tokens and candidate_tokens:
+            overlap = len(query_tokens & candidate_tokens) / max(len(query_tokens), len(candidate_tokens))
+        else:
+            overlap = 0
+
+        sim = SequenceMatcher(None, query_lower, name_lower).ratio()
+        score = (overlap * 0.6) + (sim * 0.4)
+
+        if score >= threshold:
+            results.append({**candidate, '_match_score': round(score, 3)})
+
+    results.sort(key=lambda x: x['_match_score'], reverse=True)
+    return results[:5]
