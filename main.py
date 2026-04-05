@@ -27,15 +27,17 @@ class BarcodeRequest(BaseModel):
 
 class OcrScanRequest(BaseModel):
     barcode:        str
-    scan_type:      str              # "nutrition" | "ingredients"
-    image_base64:   str              # base64-encoded JPEG/PNG
-    product_name:   Optional[str]   = None
-    existing_data:  Optional[dict]  = None  # any data already known about the product
+    scan_type:      str
+    image_base64:   str
+    product_name:   Optional[str]  = None
+    existing_data:  Optional[dict] = None
+    # FIX M-3: accept user_prefs so the AI evaluation can personalise results
+    user_prefs:     Optional[UserPreferences] = None
 
 
 class FuzzySearchRequest(BaseModel):
     query:          str
-    barcode_prefix: Optional[str] = None  # first 3 digits of barcode
+    barcode_prefix: Optional[str] = None
 
 
 class ProductSubmitRequest(BaseModel):
@@ -45,6 +47,8 @@ class ProductSubmitRequest(BaseModel):
     ingredients_text: Optional[str]  = None
     brands:           Optional[str]  = None
     quantity:         Optional[str]  = None
+    # FIX M-1: was missing — endpoint read request.existing_data → AttributeError crash
+    existing_data:    Optional[dict] = None
 
 
 # ── Existing product analysis endpoint ───────────────────────────────────────
@@ -90,18 +94,18 @@ def analyze_product(request: BarcodeRequest):
             }
         print(f"User prefs: {user_prefs_dict}")
 
-        # Product name: Google is preferred (cleaner), OFF is the fallback.
-        product_name = (google_data or {}).get("product_name") or                        (food_data  or {}).get("product_name") or None
+        product_name = (
+            (google_data or {}).get("product_name")
+            or (food_data  or {}).get("product_name")
+            or None
+        )
         print(f"Product name resolved: '{product_name}'")
 
         ingredients_text = food_data.get("ingredients") if food_data else None
         additives = parse_additives(ingredients_text) if ingredients_text else []
 
-        # Missing-data flags — used by Android to show blur CTAs.
-        # Check for the four key nutrient fields specifically; OFF can return
-        # a non-empty nutriments dict that only contains irrelevant derived keys.
         _KEY_NUTRIENTS = {"energy-kcal_100g", "proteins_100g", "carbohydrates_100g", "fat_100g"}
-        raw_nutriments = food_data.get("nutriments") if food_data else None
+        raw_nutriments    = food_data.get("nutriments") if food_data else None
         has_key_nutrients = bool(raw_nutriments and any(k in raw_nutriments for k in _KEY_NUTRIENTS))
         missing_nutrition   = not has_key_nutrients
         missing_ingredients = not food_data or not food_data.get("ingredients")
@@ -115,7 +119,7 @@ def analyze_product(request: BarcodeRequest):
                 additives       = additives,
                 nutrition_grade = food_data.get("nutrition_grade") if food_data else None,
                 nova_group      = food_data.get("nova_group") if food_data else None,
-                user_prefs      = user_prefs_dict
+                user_prefs      = user_prefs_dict,
             )
             print(f"AI result: {ai_result}")
         else:
@@ -138,7 +142,6 @@ def analyze_product(request: BarcodeRequest):
             "carcinogenic":      ai_result.get("carcinogenic")   if ai_result else False,
             "ai_allergens":      ai_result.get("allergens")      if ai_result else [],
             "diet":              ai_result.get("diet")           if ai_result else None,
-            # Missing data flags — Android uses these to show blur CTAs
             "missing_nutrition":   missing_nutrition,
             "missing_ingredients": missing_ingredients,
         }
@@ -156,8 +159,7 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
     Accepts a base64 image and scan_type, runs Vision API + parsing pipeline.
     Returns structured nutrition or ingredients data.
 
-    After returning to the client, submits data to OFF asynchronously
-    so the user gets instant results without waiting for OFF.
+    After returning to the client, submits data to OFF asynchronously.
     """
     try:
         print(f"\nOCR scan: barcode={request.barcode} type={request.scan_type}")
@@ -167,31 +169,40 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
 
         if not vision_data.get("success"):
             return {
-                "success": False,
-                "scan_type": request.scan_type,
-                "error": vision_data.get("error", "Could not extract text from image. Ensure good lighting and that the label fills the frame."),
-                "data": None,
+                "success":    False,
+                "scan_type":  request.scan_type,
+                "error":      vision_data.get(
+                    "error",
+                    "Could not extract text from image. "
+                    "Ensure good lighting and that the label fills the frame.",
+                ),
+                "data":       None,
                 "confidence": 0.0,
-                "warnings": []
+                "warnings":   [],
             }
-        print(f"Vision API extracted {len(vision_data.get('text', ''))} chars and {len(vision_data.get('words', []))} words")
 
-        # ── Step 2: Parse and normalize ───────────────────────────────────────
-        # FIX: Pass vision_data here instead of raw_text!
+        print(
+            f"Vision API: {len(vision_data.get('text', ''))} chars  "
+            f"{len(vision_data.get('words', []))} words  "
+            f"orientation={vision_data.get('orientation', 0)}°"
+        )
+
+        # ── Step 2: Parse and normalise ───────────────────────────────────────
         result = process_ocr_scan(vision_data, request.scan_type)
 
         print(f"Parse result: success={result['success']} confidence={result['confidence']}")
 
-        # ── Step 3: Run additives if ingredients scan ─────────────────────────
+        # ── Step 3: Additives if ingredients scan ─────────────────────────────
         additives = []
         if request.scan_type == 'ingredients' and result['success']:
             additives = parse_additives(result['data'])
 
-        # ── Step 4: Run AI evaluation if we now have full data ────────────────
+        # ── Step 4: AI evaluation ─────────────────────────────────────────────
+        # FIX M-3: pass user_prefs through so recommendations are personalised
         ai_result = None
         if result['success']:
-            existing = request.existing_data or {}
-            nutriments = (
+            existing    = request.existing_data or {}
+            nutriments  = (
                 result['data'] if request.scan_type == 'nutrition'
                 else existing.get('nutriments')
             )
@@ -199,6 +210,16 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
                 result['data'] if request.scan_type == 'ingredients'
                 else existing.get('ingredients')
             )
+
+            # Build user_prefs dict from the request (was always {} before)
+            user_prefs_dict = {}
+            if request.user_prefs:
+                user_prefs_dict = {
+                    "restrictions": request.user_prefs.restrictions or [],
+                    "allergens":    request.user_prefs.allergens    or [],
+                    "goals":        request.user_prefs.goals        or [],
+                }
+
             if nutriments or ingredients:
                 try:
                     ai_result = evaluate_product(
@@ -207,20 +228,25 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
                         additives       = additives or existing.get('additives', []),
                         nutrition_grade = existing.get('nutrition_grade'),
                         nova_group      = existing.get('nova_group'),
-                        user_prefs      = {}
+                        user_prefs      = user_prefs_dict,   # FIX M-3
                     )
                 except Exception as e:
                     print(f"AI eval failed: {e}")
 
         # ── Step 5: Submit to OFF in background ───────────────────────────────
         if result['success']:
+            # FIX M-2: pass image_url from existing_data so OFF gets the image
+            existing   = request.existing_data or {}
+            image_url  = existing.get('image_url')
+
             background_tasks.add_task(
                 _submit_to_off_background,
-                barcode          = request.barcode,
-                product_name     = request.product_name,
-                scan_type        = request.scan_type,
-                parsed_data      = result['data'],
-                existing_data    = request.existing_data
+                barcode       = request.barcode,
+                product_name  = request.product_name,
+                scan_type     = request.scan_type,
+                parsed_data   = result['data'],
+                existing_data = request.existing_data,
+                image_url     = image_url,           # FIX M-2: was missing
             )
 
         return {
@@ -242,7 +268,7 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
             "error":      "Internal server error during OCR processing",
             "data":       None,
             "confidence": 0.0,
-            "warnings":   []
+            "warnings":   [],
         }
 
 
@@ -252,13 +278,13 @@ def _submit_to_off_background(
     scan_type:        str,
     parsed_data,
     existing_data:    Optional[dict],
-    image_url:        Optional[str] = None,  # ← NEW: from Google search
+    image_url:        Optional[str] = None,
 ):
     """Background task — runs after response is sent to client."""
     try:
         nutriments       = parsed_data if scan_type == 'nutrition'   else None
         ingredients_text = parsed_data if scan_type == 'ingredients' else None
- 
+
         if existing_data:
             if not nutriments:
                 nutriments = existing_data.get('nutriments')
@@ -266,19 +292,19 @@ def _submit_to_off_background(
                 ingredients_text = existing_data.get('ingredients')
             if not image_url:
                 image_url = existing_data.get('image_url')
- 
+
         result = submit_product_to_off(
             barcode          = barcode,
             product_name     = product_name,
             nutriments       = nutriments,
             ingredients_text = ingredients_text,
-            image_url        = image_url,    # ← NEW: passed through
+            image_url        = image_url,
         )
         print(f"OFF submission: {result}")
     except Exception as e:
         print(f"OFF background submission failed: {e}")
- 
- 
+
+
 # ── Fuzzy search endpoint ─────────────────────────────────────────────────────
 
 @app.post("/fuzzy-search")
@@ -291,38 +317,35 @@ def fuzzy_search(request: FuzzySearchRequest):
         if not request.query or len(request.query.strip()) < 2:
             return {"matches": [], "query": request.query}
 
-        # Get candidates from OFF
         candidates = fuzzy_search_off(
             query          = request.query,
-            barcode_prefix = request.barcode_prefix
+            barcode_prefix = request.barcode_prefix,
         )
 
         if not candidates:
             return {"matches": [], "query": request.query}
 
-        # Apply fuzzy scoring on our side for better results
         matches = _fuzzy_product_name_match(
             query      = request.query,
             candidates = candidates,
-            threshold  = 0.35   # lower threshold for search — user sees and confirms
+            threshold  = 0.35,
         )
 
-        # Clean up response
         clean_matches = []
         for m in matches:
             clean_matches.append({
-                "barcode":          m.get("code", ""),
-                "product_name":     m.get("product_name", ""),
-                "brands":           m.get("brands", ""),
-                "image_url":        m.get("image_url", ""),
-                "nutrition_grade":  m.get("nutrition_grades", ""),
-                "nova_group":       m.get("nova_group"),
-                "match_score":      m.get("_match_score", 0),
+                "barcode":         m.get("code", ""),
+                "product_name":    m.get("product_name", ""),
+                "brands":          m.get("brands", ""),
+                "image_url":       m.get("image_url", ""),
+                "nutrition_grade": m.get("nutrition_grades", ""),
+                "nova_group":      m.get("nova_group"),
+                "match_score":     m.get("_match_score", 0),
             })
 
         return {
             "matches": clean_matches,
-            "query":   request.query
+            "query":   request.query,
         }
 
     except Exception as e:
@@ -340,6 +363,9 @@ def submit_product(request: ProductSubmitRequest, background_tasks: BackgroundTa
     Submits to OFF asynchronously.
     """
     try:
+        # FIX M-1: request.existing_data now exists (field added to model above)
+        image_url = (request.existing_data or {}).get('image_url')
+
         background_tasks.add_task(
             submit_product_to_off,
             barcode          = request.barcode,
@@ -348,7 +374,7 @@ def submit_product(request: ProductSubmitRequest, background_tasks: BackgroundTa
             ingredients_text = request.ingredients_text,
             brands           = request.brands,
             quantity         = request.quantity,
-            image_url        = (request.existing_data or {}).get('image_url')
+            image_url        = image_url,
         )
         return {"success": True, "message": "Product data received and queued for submission"}
     except Exception as e:
