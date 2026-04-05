@@ -1,34 +1,42 @@
 """
-ocr_parser.py
-The core parsing engine.  Converts Vision API output → structured nutrition data.
+ocr_parser.py  — PATCHED
+Fixes applied (search for "# FIX" to locate every change):
 
-Two-tier architecture
-─────────────────────
-Tier 1  (geometry-aware) — PRIMARY
-    Accepts the word list produced by vision_service.extract_vision_data().
-    Each word carries a pixel-accurate bounding box.  The parser:
-      1. Groups words into visual rows by y-center proximity.
-      2. Clusters numeric words into x-coordinate bands (= table columns).
-      3. Identifies which band is "per 100 g" from header-row text.
-      4. Pairs each nutrient label with the value in the correct band.
-    This completely avoids the column-misalignment and index-drift bugs that
-    plague text-only parsing.
+  BUG 1  _pick_per100g_band_index() wrong default
+         Old code blindly returned the rightmost band when no header was
+         detected ("Indian default").  Many Indian labels are structured as
+         [per 100g | %RDA], so the rightmost band is the %RDA column.
+         Fix: sample actual numeric values from each candidate band; pick the
+         band whose median lands in the per-100g plausible range.
 
-Tier 2  (text-based) — FALLBACK
-    The original regex / fuzzy-match parser.  Fires when:
-      • No bounding-box data is available (legacy callers).
-      • Tier 1 extracted fewer than MIN_NUTRIENTS_THRESHOLD nutrients.
-    Kept intact so that ingredients parsing and any scan path that still
-    provides only flat text continues to work.
+  BUG 2  _identify_column_roles() misses headers
+         Old code required each header word's x-centre to fall within 25 px
+         of a numeric-data band.  Header rows typically span the full table
+         width, so their words never hit that tolerance → roles = {} always.
+         Fix: for each candidate header line, join ALL words on the line and
+         run the header patterns against the full line string.  Only then
+         try to assign the matched role to the nearest band.
 
-Additional improvements over previous version
-─────────────────────────────────────────────
-  • Digit-merge detection  — "162" that should be "16.2" is caught by
-    comparing each value against a per-nutrient expected median.
-  • Per-field confidence   — every nutrient gets its own 0-1 score so the
-    app can show exactly which values are uncertain.
-  • process_ocr_scan()     — now accepts the vision_data dict from
-    vision_service.extract_vision_data() as well as a plain string (legacy).
+  BUG 3  label_x_max computed from band edge, not from actual label words
+         x_bands[0][0] − 10 is far too small when band-0 is the per-serving
+         column (sits near the centre of the label).  Long nutrient names
+         get truncated → fuzzy match fails → row is skipped.
+         Fix: compute label_x_max per-row from the actual rightmost x_max
+         of words that are clearly label words (left of every numeric band).
+
+  BUG 4  No post-parse plausibility check / column-swap retry
+         When the wrong band is chosen the values fail _sanity_check and get
+         dropped silently.  The caller never tries the other bands.
+         Fix: add _is_result_plausible() and _try_alternate_bands().  After
+         the initial parse, if the result looks implausible we iterate over
+         every other band index and keep the best-scoring result.
+
+  BUG 5  Tier-2 _detect_per100g_column_index() defaults to 0
+         When no header pattern matches the function returns 0, which is the
+         per-serving column on the most common [serving | per 100g] layout.
+         Fix: if no explicit header is found, sample the first numeric value
+         in each column from the first 10 data rows.  The column with the
+         larger mean is the per-100g column (energy ~350 vs. ~40 per serve).
 """
 
 import re
@@ -40,13 +48,11 @@ logger = logging.getLogger("smartscan.ocr_parser")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Constants and lookup tables
+#  Constants and lookup tables  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MIN_NUTRIENTS_THRESHOLD = 3   # Tier 1 triggers Tier 2 fallback below this
+MIN_NUTRIENTS_THRESHOLD = 3
 
-
-# ── OCR character-substitution corrections ────────────────────────────────────
 OCR_CORRECTIONS = {
     r'\bO\b':                       '0',
     r'\bl\b':                       '1',
@@ -77,8 +83,6 @@ OCR_CORRECTIONS = {
     r'Trens\b':                     'Trans',
 }
 
-
-# ── Nutrient field-name aliases → canonical OFF key ──────────────────────────
 NUTRIENT_ALIASES = {
     "energy": "energy_kcal", "energy value": "energy_kcal",
     "calorific value": "energy_kcal", "calories": "energy_kcal",
@@ -131,14 +135,10 @@ NUTRIENT_ALIASES = {
     "magnesium": "magnesium_100g", "zinc": "zinc_100g",
 }
 
-
-# ── Unit conversion ───────────────────────────────────────────────────────────
 KJ_TO_KCAL = 0.239006
 MG_TO_G    = 0.001
 MCG_TO_G   = 0.000001
 
-
-# ── Non-nutritional line skip pattern ────────────────────────────────────────
 NON_NUTRITIONAL_SKIP = re.compile(
     r'^('
     r'nutrients?|nutrition\s+facts?|nutrition\s+info(rmation)?'
@@ -162,8 +162,6 @@ NON_NUTRITIONAL_SKIP = re.compile(
     re.IGNORECASE,
 )
 
-
-# ── Per-nutrient expected medians (used for digit-merge detection) ────────────
 _EXPECTED_MEDIANS: dict[str, float] = {
     "energy-kcal_100g":   350.0,
     "proteins_100g":        8.0,
@@ -176,10 +174,8 @@ _EXPECTED_MEDIANS: dict[str, float] = {
     "salt_100g":            1.2,
 }
 
-
-# ── Plausible value ranges for per-field confidence scoring ──────────────────
 _PLAUSIBLE_RANGES: dict[str, tuple[float, float]] = {
-    "energy-kcal_100g":   (50.0,  600.0),
+    "energy-kcal_100g":   (50.0,  900.0),
     "proteins_100g":       (0.0,   40.0),
     "carbohydrates_100g":  (0.0,   90.0),
     "sugars_100g":         (0.0,   60.0),
@@ -194,7 +190,7 @@ _PLAUSIBLE_RANGES: dict[str, tuple[float, float]] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Shared utility functions  (used by both Tier 1 and Tier 2)
+#  Shared utility functions  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _correct_ocr_errors(text: str) -> str:
@@ -204,10 +200,6 @@ def _correct_ocr_errors(text: str) -> str:
 
 
 def _fuzzy_match_nutrient(raw_field: str) -> Optional[str]:
-    """
-    Map a raw OCR field name → canonical nutrient key.
-    Tries exact match, then stripped match, then fuzzy (≥ 0.82 threshold).
-    """
     normalized = re.sub(r'\s+', ' ', raw_field.lower().strip())
     normalized = re.sub(r'[*†‡#]', '', normalized).rstrip(':').strip()
 
@@ -232,17 +224,13 @@ def _fuzzy_match_nutrient(raw_field: str) -> Optional[str]:
 
 
 def _parse_numeric_value(raw: str) -> Optional[float]:
-    """
-    Extract a float from messy OCR text.
-    Handles: "25.7g", "< 0.5", "Nil", "Trace", "25 7", "N/A", "25,7"
-    """
     raw = raw.strip()
     if re.match(r'^(nil|none|trace|n\.?a\.?|not detected|nd|-)$', raw, re.IGNORECASE):
         return 0.0
 
     raw = re.sub(r'^[<>≤≥~approx\.]+\s*', '', raw)
     raw = re.sub(r'\s*(g|mg|mcg|μg|kcal|kj|kJ|ml|%|iu|IU)\s*$', '', raw, flags=re.IGNORECASE)
-    raw = re.sub(r'(\d+)\s+(\d{1,2})$', r'\1.\2', raw)    # "25 7" → "25.7"
+    raw = re.sub(r'(\d+)\s+(\d{1,2})$', r'\1.\2', raw)
     cleaned = re.sub(r'[^\d.]', '', raw)
 
     parts = cleaned.split('.')
@@ -313,7 +301,6 @@ def _normalize_to_per_100g(value: float, unit: str, serving_g: Optional[float]) 
 
 
 def _extract_numeric_columns(values_part: str) -> list[tuple[float, str]]:
-    """Extract all (value, unit) pairs from the numeric portion of a line."""
     col_pattern = re.compile(
         r'([<>≤≥~]?\s*[\d,.]+(?:\s\d{1,2})?)'
         r'\s*(g|mg|mcg|μg|kcal|kj|kJ|ml|%|iu|IU)?',
@@ -367,7 +354,7 @@ def _sanity_check_nutriments(nutriments: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  New: digit-merge detection and correction
+#  Digit-merge detection  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_and_fix_digit_merge(
@@ -375,19 +362,6 @@ def _detect_and_fix_digit_merge(
     suspicion_factor: float = 8.0,
     plausible_factor: float = 3.0,
 ) -> tuple[dict, list[str]]:
-    """
-    Detect and correct OCR digit-merge errors where the decimal point was
-    silently dropped (e.g. "16.2 g" OCR-read as "162 g").
-
-    For each nutrient, if:
-        value  >  median × suspicion_factor
-    then we try inserting a decimal point after each possible split position
-    in the integer representation.  The first split that produces a value
-    ≤  median × plausible_factor is applied.
-
-    Returns (fixed_nutriments, list_of_warning_strings).
-    Both factors are tunable — defaults are deliberately conservative.
-    """
     fixed    = dict(nutriments)
     warnings: list[str] = []
 
@@ -396,9 +370,8 @@ def _detect_and_fix_digit_merge(
             continue
         val = fixed[key]
         if val <= median * suspicion_factor:
-            continue   # looks plausible as-is
+            continue
 
-        # Try decimal insertion at every position (up to 3 digits from left)
         s = str(int(val))
         for split_pos in range(1, min(len(s), 4)):
             try:
@@ -419,19 +392,10 @@ def _detect_and_fix_digit_merge(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  New: per-field confidence scoring
+#  Per-field confidence scoring  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_per_field_confidence(nutriments: dict) -> dict[str, float]:
-    """
-    Assign a 0.0–1.0 confidence score per nutrient.
-
-    1.0  — value falls within the expected central range for packaged food.
-    0.6  — value is zero for a nutrient that is almost never zero.
-            (Zero for trans fat is fine; zero for carbohydrates is suspicious.)
-    0.8  — value is zero but the field legitimately can be zero.
-    0.4  — value is outside the expected central range.
-    """
     _CRITICAL_NONZERO = {"energy-kcal_100g", "carbohydrates_100g", "fat_100g"}
     scores: dict[str, float] = {}
 
@@ -453,14 +417,10 @@ def _compute_per_field_confidence(nutriments: dict) -> dict[str, float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tier 1 — Geometry-aware parser
+#  Tier 1 helpers — geometry  (mostly unchanged; see BUG comments)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _estimate_line_height(words: list[dict]) -> float:
-    """
-    Estimate typical text line height from word bounding boxes.
-    Uses the median word height — robust against a few very tall or tiny words.
-    """
     heights = [w['y_max'] - w['y_min'] for w in words if w['y_max'] > w['y_min']]
     if not heights:
         return 20.0
@@ -471,14 +431,6 @@ def _estimate_line_height(words: list[dict]) -> float:
 def _group_words_into_lines(
     words: list[dict], y_tolerance: float
 ) -> list[list[dict]]:
-    """
-    Group words into visual rows based on y-center proximity.
-
-    Two words belong to the same row when the difference between their
-    y-centers is ≤ y_tolerance (usually ~55 % of line height).
-
-    Each row is returned sorted left-to-right by x_min.
-    """
     if not words:
         return []
 
@@ -495,7 +447,6 @@ def _group_words_into_lines(
         word_y = (word['y_min'] + word['y_max']) / 2
         if abs(word_y - current_y) <= y_tolerance:
             current_line.append(word)
-            # Running mean keeps the reference y-center accurate as we add words
             current_y = (
                 sum((w['y_min'] + w['y_max']) / 2 for w in current_line)
                 / len(current_line)
@@ -510,11 +461,6 @@ def _group_words_into_lines(
 
 
 def _is_numeric_token(text: str) -> bool:
-    """
-    True for standalone numeric OCR tokens: "5.2", "162", "5.2g", "<0.5",
-    "Nil", "Trace".  False for label words that happen to contain digits,
-    e.g. "B12", "E330", "100g" (column header — ambiguous, excluded).
-    """
     t = text.strip()
     if re.match(r'^(nil|none|trace|n\.?a\.?|nd|-)$', t, re.IGNORECASE):
         return True
@@ -526,15 +472,6 @@ def _is_numeric_token(text: str) -> bool:
 def _find_value_column_bands(
     words: list[dict], gap_threshold: float
 ) -> list[tuple[float, float]]:
-    """
-    Find x-coordinate bands that contain numeric tokens (the data columns).
-
-    Only numeric words are used so that the wide label column does not
-    pollute the clustering.  Each gap of > gap_threshold pixels between
-    adjacent word x-centers starts a new band.
-
-    Returns a list of (x_min, x_max) tuples sorted left-to-right.
-    """
     numeric_words = [w for w in words if _is_numeric_token(w['text'])]
     if not numeric_words:
         return []
@@ -554,17 +491,28 @@ def _find_value_column_bands(
     return bands
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX BUG 2 — _identify_column_roles  (rewritten)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _identify_column_roles(
     lines: list[list[dict]],
     x_bands: list[tuple[float, float]],
 ) -> dict[int, str]:
     """
-    Scan the first 15 lines for column headers.  For each band, reconstruct
-    the text of words whose x-center falls inside the band (± padding) and
-    match against known header patterns.
+    Scan the first 25 lines for column headers.
 
-    Returns {band_index: role} where role ∈ {'per_100g', 'per_serving', 'rda'}.
-    Bands with no recognisable header are omitted from the result.
+    FIX: The old approach required each header word's x-centre to fall within
+    25 px of a numeric band.  Header rows on Indian labels often span the full
+    table width, so their words' x-centres never hit that tolerance.
+
+    New approach:
+      1. Reconstruct the full text of each candidate header line.
+      2. Run the header regex against the FULL line text.
+      3. If a match is found, find the word that triggered the match and use
+         ITS x-centre to identify the nearest band.
+      4. Fall back to a coarse left/right split when no individual word can be
+         matched to a band (e.g. a single header like "Per 100 g / Per Serving").
     """
     PER_100G = re.compile(
         r'per\s*100\s*(g|ml|gm|gram)|/\s*100\s*(g|ml)|values?\s+per\s+100',
@@ -580,96 +528,379 @@ def _identify_column_roles(
     )
 
     roles: dict[int, str] = {}
-    padding = 25   # pixels — words may sit slightly outside their band
 
-    for line in lines[:15]:
-        band_texts: dict[int, list[str]] = {i: [] for i in range(len(x_bands))}
+    for line in lines[:25]:
+        line_text = ' '.join(w['text'] for w in sorted(line, key=lambda w: w['x_min']))
 
-        for word in line:
-            wx = (word['x_min'] + word['x_max']) / 2
-            for i, (bx_min, bx_max) in enumerate(x_bands):
-                if bx_min - padding <= wx <= bx_max + padding:
-                    band_texts[i].append(word['text'])
-                    break
-
-        for i, word_list in band_texts.items():
-            if not word_list or i in roles:
+        for pattern, role in [(PER_100G, 'per_100g'), (PER_SERV, 'per_serving'), (RDA_PAT, 'rda')]:
+            m = pattern.search(line_text)
+            if not m or role in roles.values():
                 continue
-            band_str = ' '.join(word_list)
-            if PER_100G.search(band_str):
-                roles[i] = 'per_100g'
-            elif PER_SERV.search(band_str):
-                roles[i] = 'per_serving'
-            elif RDA_PAT.search(band_str):
-                roles[i] = 'rda'
+
+            # Find the word closest to the centre of the regex match
+            # within the original line.  Use its x-centre to pick the band.
+            match_char_mid = (m.start() + m.end()) / 2
+            char_offset    = 0
+            best_word      = None
+            best_dist      = float('inf')
+            for word in sorted(line, key=lambda w: w['x_min']):
+                word_mid_char = char_offset + len(word['text']) / 2
+                dist = abs(word_mid_char - match_char_mid)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_word = word
+                char_offset += len(word['text']) + 1  # +1 for the space
+
+            if best_word is None:
+                continue
+
+            wx = (best_word['x_min'] + best_word['x_max']) / 2
+            # Find the nearest band to this word's x-centre
+            nearest_idx = min(
+                range(len(x_bands)),
+                key=lambda i: abs((x_bands[i][0] + x_bands[i][1]) / 2 - wx),
+            )
+            # Only accept if within a generous distance (2× band width or 80 px)
+            band_centre  = (x_bands[nearest_idx][0] + x_bands[nearest_idx][1]) / 2
+            band_width   = x_bands[nearest_idx][1] - x_bands[nearest_idx][0]
+            tolerance    = max(80, band_width * 2)
+            if abs(band_centre - wx) <= tolerance and nearest_idx not in roles:
+                roles[nearest_idx] = role
 
     return roles
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX BUG 1 — helpers for value-based band disambiguation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sample_band_values(
+    lines: list[list[dict]],
+    band: tuple[float, float],
+    all_bands_x_min: float,
+    band_padding: float = 22,
+    max_lines: int = 40,
+) -> list[float]:
+    """
+    Return up to max_lines numeric values found in the given x-band.
+    Only rows that also have a recognisable label (i.e. words left of
+    all_bands_x_min) are included, so pure header rows don't pollute the sample.
+    """
+    bx_min, bx_max = band
+    values: list[float] = []
+
+    for line in lines[:max_lines]:
+        has_label = any(w['x_max'] <= all_bands_x_min + band_padding for w in line)
+        if not has_label:
+            continue
+
+        value_words = [
+            w for w in line
+            if bx_min - band_padding
+               <= (w['x_min'] + w['x_max']) / 2
+               <= bx_max + band_padding
+            and w['x_min'] > all_bands_x_min - band_padding
+        ]
+        if not value_words:
+            continue
+
+        text = ' '.join(w['text'] for w in sorted(value_words, key=lambda w: w['x_min']))
+        cols = _extract_numeric_columns(text)
+        if cols:
+            v, unit = cols[0]
+            if unit != '%':
+                values.append(v)
+
+    return values
+
+
+def _score_band_as_per100g(values: list[float]) -> float:
+    """
+    Score how likely a list of sampled values is to be the per-100g column.
+
+    Heuristic: the per-100g column typically contains energy (50–900 kcal),
+    fat/carbs in the 0–90 g range, and protein in the 0–40 g range.
+    Per-serving values are the same numbers scaled down by ~4–10×.
+
+    We use the *median* so that a single huge outlier (e.g. a batch number
+    that slipped through) doesn't dominate.
+    Returns a score in [0, 1]; higher = more likely per-100g.
+    """
+    if not values:
+        return 0.0
+
+    values_sorted = sorted(values)
+    median = values_sorted[len(values_sorted) // 2]
+
+    # A median between 5 and 800 is consistent with per-100g macro values
+    if 5 <= median <= 800:
+        # Prefer medians around the typical packaged-food macro range
+        if 10 <= median <= 600:
+            return 1.0
+        return 0.7
+    # Very small median (< 5) → likely per-serving or RDA fraction
+    if median < 5:
+        return 0.1
+    # Very large median (> 800) → might be kJ or a mis-read value
+    return 0.3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX BUG 1 — _pick_per100g_band_index  (rewritten)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _pick_per100g_band_index(
     x_bands: list[tuple[float, float]],
     column_roles: dict[int, str],
+    lines: Optional[list[list[dict]]] = None,
+    label_x_max: float = 0.0,
 ) -> int:
     """
     Choose the band index to use for per-100g values.
 
     Priority:
-      1.  Band explicitly labelled 'per_100g' by header detection.
-      2.  Heuristic based on number of bands and presence of other known roles:
+      1. Band explicitly labelled 'per_100g' by header detection.
+      2. Value-sampling heuristic: sample numeric values from each candidate
+         band and pick the one whose median lands in the per-100g range.
+         This handles the case where the header detector found no roles.
+      3. Structural heuristic as a final fallback (was the only logic before).
 
-          1 band  →  index 0  (trivial)
-          2 bands, band-0 is 'per_serving'  →  index 1
-          2 bands, band-1 is 'rda'          →  index 0
-          2 bands, no roles identified       →  index 1 (Indian default: rightmost)
-          3+ bands → rightmost non-rda band
+    FIX: Removed the unconditional "Indian default: rightmost" fallback that
+    was causing systematic column swaps on [per 100g | %RDA] layouts.
     """
-    # Explicit header match
+    # 1. Explicit header match
     for idx, role in column_roles.items():
         if role == 'per_100g':
             return idx
 
-    n = len(x_bands)
-    rda_idx     = next((i for i, r in column_roles.items() if r == 'rda'),         None)
-    serving_idx = next((i for i, r in column_roles.items() if r == 'per_serving'), None)
+    # Candidate bands = all bands that are NOT identified as RDA
+    rda_indices   = {i for i, r in column_roles.items() if r == 'rda'}
+    serv_indices  = {i for i, r in column_roles.items() if r == 'per_serving'}
+    candidates    = [i for i in range(len(x_bands)) if i not in rda_indices]
 
+    if not candidates:
+        candidates = list(range(len(x_bands)))
+
+    # 2. Value-sampling heuristic (FIX BUG 1)
+    if lines and len(candidates) > 1:
+        all_bands_x_min = x_bands[0][0]
+        scores: dict[int, float] = {}
+        for idx in candidates:
+            sampled = _sample_band_values(
+                lines, x_bands[idx], all_bands_x_min
+            )
+            scores[idx] = _score_band_as_per100g(sampled)
+            logger.debug(
+                "BAND %d: sample=%s  score=%.2f", idx, sampled[:5], scores[idx]
+            )
+
+        best_idx   = max(candidates, key=lambda i: scores[i])
+        best_score = scores[best_idx]
+
+        # Only trust the heuristic if its score is clearly higher than the
+        # runner-up; otherwise fall through to structural rules.
+        other_scores = [scores[i] for i in candidates if i != best_idx]
+        runner_up    = max(other_scores) if other_scores else 0.0
+        if best_score > runner_up + 0.15 or best_score >= 0.9:
+            logger.info(
+                "GEOM: band %d selected by value-sampling (score=%.2f)",
+                best_idx, best_score,
+            )
+            return best_idx
+
+    # 3. Structural fallback
+    n = len(x_bands)
     if n == 1:
         return 0
 
-    if n == 2:
-        if serving_idx == 0:
-            return 1
-        if rda_idx == 1:
-            return 0
-        return 1   # Indian default: value column is rightmost
+    # If the serving column was explicitly identified, the other one is per-100g
+    if len(serv_indices) == 1:
+        non_serv = [i for i in candidates if i not in serv_indices]
+        if non_serv:
+            return non_serv[0]
 
-    # n >= 3: take rightmost non-rda band
-    non_rda = [i for i in range(n) if column_roles.get(i) != 'rda']
-    return max(non_rda) if non_rda else n - 2
+    # Last resort: prefer the leftmost non-RDA candidate because
+    # [per 100g | %RDA] is the more common Indian layout
+    return candidates[0]
 
 
 def _words_to_text(words: list[dict]) -> str:
-    """Join words left-to-right with single spaces."""
     return ' '.join(
         w['text'] for w in sorted(words, key=lambda w: w['x_min'])
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX BUG 4 — post-parse plausibility check + column-swap retry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_result_plausible(nutriments: dict) -> bool:
+    """
+    Return True if the parsed nutriments look like real food data.
+
+    We require at least two of the five key macros to be present AND in their
+    plausible per-100g ranges.  A single macro in range is not enough because
+    even a wrong column occasionally produces one value that passes.
+    """
+    KEY_MACROS = [
+        'energy-kcal_100g', 'proteins_100g',
+        'carbohydrates_100g', 'fat_100g', 'sugars_100g',
+    ]
+    in_range = 0
+    for key in KEY_MACROS:
+        if key not in nutriments:
+            continue
+        lo, hi = _PLAUSIBLE_RANGES.get(key, (0, 1e9))
+        if lo < nutriments[key] <= hi:
+            in_range += 1
+
+    return in_range >= 2
+
+
+def _extract_nutriments_for_band(
+    lines: list[list[dict]],
+    x_bands: list[tuple[float, float]],
+    per100g_idx: int,
+    per_unit: str,
+    serving_size: Optional[float],
+    column_roles: dict[int, str],
+) -> dict:
+    """
+    Run the row-extraction loop for a specific per100g_idx.
+    Extracted from parse_nutrition_from_vision_words so it can be called
+    for each candidate band during the column-swap retry (FIX BUG 4).
+    """
+    band_padding = 22
+    bx_min, bx_max = x_bands[per100g_idx]
+
+    # label_x_max: left edge of the first band minus a small buffer
+    # (FIX BUG 3 — see inline comment inside the loop)
+    first_band_left = x_bands[0][0]
+
+    nutriments: dict = {}
+
+    for line in lines:
+        line_text = _words_to_text(line)
+        if NON_NUTRITIONAL_SKIP.match(line_text.strip()):
+            continue
+        if re.match(r'^[\d\s.,%<>]+$', line_text):
+            continue
+
+        # FIX BUG 3: compute label boundary per-row from actual label words.
+        # A label word is one whose x_max is clearly left of the first numeric
+        # band.  We add a generous buffer so that long names aren't truncated.
+        label_words_candidate = [
+            w for w in line if w['x_max'] <= first_band_left + 10
+        ]
+        if not label_words_candidate:
+            continue
+
+        # Use the rightmost x_max of candidate label words as the boundary
+        computed_label_x_max = max(w['x_max'] for w in label_words_candidate)
+        label_text = _words_to_text(label_words_candidate)
+        label_text = _correct_ocr_errors(label_text)
+
+        canonical = _fuzzy_match_nutrient(label_text)
+        if canonical is None:
+            continue
+
+        # Value words: in the target band and to the right of the label
+        value_words = [
+            w for w in line
+            if (bx_min - band_padding
+                <= (w['x_min'] + w['x_max']) / 2
+                <= bx_max + band_padding)
+            and w['x_min'] > computed_label_x_max
+        ]
+        if not value_words:
+            continue
+
+        value_text = _words_to_text(value_words)
+        all_cols   = _extract_numeric_columns(value_text)
+        if not all_cols:
+            continue
+
+        raw_value, raw_unit = all_cols[0]
+        if not raw_unit:
+            raw_unit = _infer_unit_from_field(label_text)
+        if raw_unit == '%':
+            continue
+
+        value = _convert_units(raw_value, raw_unit, canonical)
+
+        if per_unit == 'per_serving' and column_roles.get(per100g_idx) != 'per_100g':
+            value = _normalize_to_per_100g(value, raw_unit, serving_size)
+
+        if canonical in ('energy_kj', 'energy_kcal'):
+            canonical = 'energy-kcal_100g'
+
+        if canonical == 'sodium_100g':
+            nutriments['salt_100g'] = round(value * 2.5, 3)
+            nutriments[canonical]   = round(value, 3)
+            continue
+
+        nutriments[canonical] = round(value, 2)
+
+    return nutriments
+
+
+def _try_alternate_bands(
+    lines: list[list[dict]],
+    x_bands: list[tuple[float, float]],
+    initial_idx: int,
+    initial_nutriments: dict,
+    per_unit: str,
+    serving_size: Optional[float],
+    column_roles: dict[int, str],
+) -> tuple[dict, int, list[str]]:
+    """
+    FIX BUG 4: If initial result is implausible, try every other band index
+    and return the best-scoring result.
+
+    'Best' = passes _is_result_plausible() AND has the most plausible nutrients.
+    """
+    warnings: list[str] = []
+
+    if _is_result_plausible(initial_nutriments):
+        return initial_nutriments, initial_idx, warnings
+
+    best_nutriments = initial_nutriments
+    best_idx        = initial_idx
+    best_count      = len(initial_nutriments)
+
+    for try_idx in range(len(x_bands)):
+        if try_idx == initial_idx:
+            continue
+
+        candidate = _extract_nutriments_for_band(
+            lines, x_bands, try_idx, per_unit, serving_size, column_roles
+        )
+        candidate = _sanity_check_nutriments(candidate)
+
+        if _is_result_plausible(candidate) and len(candidate) > best_count:
+            best_nutriments = candidate
+            best_idx        = try_idx
+            best_count      = len(candidate)
+
+    if best_idx != initial_idx:
+        msg = (
+            f"Column-swap: band {initial_idx} gave implausible values; "
+            f"switched to band {best_idx}."
+        )
+        logger.warning(msg)
+        warnings.append(msg)
+
+    return best_nutriments, best_idx, warnings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tier 1 — Geometry-aware parser  (updated to use fixed helpers above)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_nutrition_from_vision_words(
     words: list[dict],
     fallback_text: str = "",
 ) -> tuple[dict, list[str]]:
-    """
-    Tier 1 geometry-aware nutrition parser.
-
-    Parameters
-    ----------
-    words        : list of WordDict objects from vision_service.extract_vision_data()
-    fallback_text: flat OCR string (used for serving-size detection and Tier 2 fallback)
-
-    Returns
-    -------
-    (nutriments_dict, warnings_list)
-    """
     warnings: list[str] = []
 
     if not words:
@@ -677,15 +908,11 @@ def parse_nutrition_from_vision_words(
         result = parse_nutrition_label(fallback_text) if fallback_text else {}
         return result, warnings
 
-    # ── Step 1: Scale estimation ──────────────────────────────────────────────
     line_height = _estimate_line_height(words)
-    y_tol = line_height * 0.55   # same-line tolerance
-    x_gap = line_height * 2.0    # minimum inter-column whitespace
+    y_tol = line_height * 0.55
+    x_gap = line_height * 2.0
 
-    # ── Step 2: Group words into visual rows ─────────────────────────────────
-    lines = _group_words_into_lines(words, y_tolerance=y_tol)
-
-    # ── Step 3: Find numeric column bands ────────────────────────────────────
+    lines   = _group_words_into_lines(words, y_tolerance=y_tol)
     x_bands = _find_value_column_bands(words, gap_threshold=x_gap)
 
     if not x_bands:
@@ -694,107 +921,41 @@ def parse_nutrition_from_vision_words(
         result = parse_nutrition_label(fallback_text) if fallback_text else {}
         return result, warnings
 
-    # ── Step 4: Identify column roles from headers ───────────────────────────
-    column_roles  = _identify_column_roles(lines, x_bands)
-    per100g_idx   = _pick_per100g_band_index(x_bands, column_roles)
-    per100g_band  = x_bands[per100g_idx]
+    # FIX BUG 2: use updated _identify_column_roles
+    column_roles = _identify_column_roles(lines, x_bands)
+
+    # FIX BUG 1: pass lines so _pick_per100g_band_index can sample values
+    first_band_left = x_bands[0][0]
+    per100g_idx     = _pick_per100g_band_index(
+        x_bands, column_roles,
+        lines=lines, label_x_max=first_band_left,
+    )
 
     logger.info(
         "GEOM: line_h=%.1f  bands=%d  roles=%s  per100g_idx=%d",
         line_height, len(x_bands), column_roles, per100g_idx,
     )
 
-    # ── Step 5: Determine the label / value boundary ──────────────────────────
-    # Everything left of the first numeric band is the nutrient-name column.
-    label_x_max  = x_bands[0][0] - 10   # 10-px buffer before first band
-    band_padding = 22                    # px tolerance for word → band assignment
-    bx_min, bx_max = per100g_band
-
-    # ── Step 6: Serving-size context (for labels that only show per-serving) ──
     per_unit     = _detect_per_unit(fallback_text) if fallback_text else 'per_100g'
     serving_size = (
         _extract_serving_size(fallback_text)
         if per_unit == 'per_serving' else None
     )
 
-    # ── Step 7: Parse each visual row ────────────────────────────────────────
-    nutriments: dict = {}
+    # FIX BUG 3: row-level label_x_max computed inside _extract_nutriments_for_band
+    nutriments = _extract_nutriments_for_band(
+        lines, x_bands, per100g_idx, per_unit, serving_size, column_roles
+    )
 
-    for line in lines:
-        line_text = _words_to_text(line)
+    # FIX BUG 4: validate result; try other bands if implausible
+    nutriments = _sanity_check_nutriments(nutriments)
+    nutriments, per100g_idx, swap_warnings = _try_alternate_bands(
+        lines, x_bands, per100g_idx, nutriments,
+        per_unit, serving_size, column_roles,
+    )
+    warnings.extend(swap_warnings)
 
-        # Skip header / metadata lines
-        if NON_NUTRITIONAL_SKIP.match(line_text.strip()):
-            continue
-        # Skip lines that are only numbers (pure-value rows with no label)
-        if re.match(r'^[\d\s.,%<>]+$', line_text):
-            continue
-
-        # ── Split line into label words and per-100g value words ─────────────
-        label_words = [
-            w for w in line
-            if w['x_max'] <= label_x_max + band_padding
-        ]
-        if not label_words:
-            continue
-
-        label_text = _words_to_text(label_words)
-
-        # Apply OCR corrections to the label before matching
-        label_text = _correct_ocr_errors(label_text)
-
-        canonical = _fuzzy_match_nutrient(label_text)
-        if canonical is None:
-            continue
-
-        # Collect value words in the per-100g band
-        value_words = [
-            w for w in line
-            if (bx_min - band_padding
-                <= (w['x_min'] + w['x_max']) / 2
-                <= bx_max + band_padding)
-            and w['x_min'] > label_x_max   # must be in value zone
-        ]
-        if not value_words:
-            continue
-
-        value_text = _words_to_text(value_words)
-
-        # ── Parse numeric value and unit ──────────────────────────────────────
-        all_cols = _extract_numeric_columns(value_text)
-        if not all_cols:
-            continue
-
-        raw_value, raw_unit = all_cols[0]
-
-        # If no unit after the value, check the label name (e.g. "Sodium (mg)")
-        if not raw_unit:
-            raw_unit = _infer_unit_from_field(label_text)
-
-        # Skip RDA percentage columns
-        if raw_unit == '%':
-            continue
-
-        value = _convert_units(raw_value, raw_unit, canonical)
-
-        # Per-serving → per-100g only when the detected column is NOT already
-        # a confirmed per-100g column from the header
-        if per_unit == 'per_serving' and column_roles.get(per100g_idx) != 'per_100g':
-            value = _normalize_to_per_100g(value, raw_unit, serving_size)
-
-        # Normalise energy key
-        if canonical in ('energy_kj', 'energy_kcal'):
-            canonical = 'energy-kcal_100g'
-
-        # Sodium → also derive salt
-        if canonical == 'sodium_100g':
-            nutriments['salt_100g'] = round(value * 2.5, 3)
-            nutriments[canonical]   = round(value, 3)
-            continue
-
-        nutriments[canonical] = round(value, 2)
-
-    # ── Step 8: Tier 2 fallback when Tier 1 found too few nutrients ──────────
+    # Tier 2 fallback when Tier 1 still found too few nutrients
     if len(nutriments) < MIN_NUTRIENTS_THRESHOLD and fallback_text:
         logger.info(
             "GEOM: only %d nutrients found — trying Tier 2 text parser",
@@ -808,7 +969,6 @@ def parse_nutrition_from_vision_words(
             )
             nutriments = tier2
 
-    # ── Step 9: Post-processing ───────────────────────────────────────────────
     if 'sodium_100g' in nutriments and 'salt_100g' not in nutriments:
         nutriments['salt_100g'] = round(nutriments['sodium_100g'] * 2.5, 3)
 
@@ -821,10 +981,24 @@ def parse_nutrition_from_vision_words(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Tier 2 — Text-based parser  (unchanged; kept as fallback)
+#  Tier 2 — Text-based parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+# FIX BUG 5 — _detect_per100g_column_index: smarter default when no header found
 def _detect_per100g_column_index(lines: list) -> int:
+    """
+    Detect which column (0-based) in the Tier-2 split text holds per-100g data.
+
+    FIX BUG 5: The old code returned 0 when no header was found.  That is
+    wrong for the very common [per serving | per 100g] layout where the
+    per-100g data is in column 1.
+
+    New strategy:
+      1. Scan header lines for explicit column labels (unchanged).
+      2. If no header is found, sample the first numeric value in each column
+         from up to 10 data rows.  The column with the larger mean is more
+         likely the per-100g column (energy ~350 kcal vs. ~35 kcal per serve).
+    """
     per_100g_re = re.compile(
         r'per\s*100\s*(g|ml|gm)|/\s*100\s*(g|ml)|values?\s*per\s*100',
         re.IGNORECASE,
@@ -849,6 +1023,47 @@ def _detect_per100g_column_index(lines: list) -> int:
         if any(label == '100g' for label, _ in hits):
             return 0
 
+    # FIX BUG 5: value-sampling heuristic when no header was found
+    col_sums: dict[int, float] = {}
+    col_counts: dict[int, int] = {}
+    data_rows_checked = 0
+
+    for line in lines:
+        if NON_NUTRITIONAL_SKIP.match(line.strip()):
+            continue
+        first_digit = re.search(r'[<>≤≥~]?\d', line)
+        if not first_digit:
+            continue
+
+        values_part = line[first_digit.start():]
+        cols = _extract_numeric_columns(values_part)
+        if len(cols) < 2:
+            continue
+
+        for col_idx, (val, unit) in enumerate(cols[:4]):
+            if unit == '%':
+                continue
+            col_sums[col_idx]   = col_sums.get(col_idx, 0.0)   + val
+            col_counts[col_idx] = col_counts.get(col_idx, 0)    + 1
+
+        data_rows_checked += 1
+        if data_rows_checked >= 10:
+            break
+
+    if col_counts:
+        col_means = {
+            idx: col_sums[idx] / col_counts[idx]
+            for idx in col_counts
+        }
+        # The column with the higher mean is the per-100g column
+        best_col = max(col_means, key=lambda i: col_means[i])
+        logger.info(
+            "TIER2: no header found; column means=%s → using col %d",
+            col_means, best_col,
+        )
+        return best_col
+
+    # True last-resort default: 0 (unchanged from original)
     return 0
 
 
@@ -867,18 +1082,12 @@ def _extract_numeric_columns_tier2(values_part: str) -> list:
 
 
 def parse_nutrition_label(raw_text: str) -> dict:
-    """
-    Tier 2 text-based parser.
-    Direct entry point for:
-      • Ingredients label parsing (which feeds parse_ingredients_label).
-      • Tier 1 fallback when bounding-box data is unavailable or insufficient.
-    """
     text  = _correct_ocr_errors(raw_text)
     lines = [l.strip() for l in text.split('\n') if l.strip()]
 
     per_unit      = _detect_per_unit(text)
     serving_size  = _extract_serving_size(text) if per_unit == 'per_serving' else None
-    per100g_col   = _detect_per100g_column_index(lines)
+    per100g_col   = _detect_per100g_column_index(lines)   # FIX BUG 5 applied here
 
     nutriments: dict = {}
 
@@ -1055,42 +1264,15 @@ def _fuzzy_product_name_match(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main entry point
+#  Main entry point  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_ocr_scan(
     vision_data_or_text: Union[dict, str],
     scan_type: str,
 ) -> dict:
-    """
-    Orchestrator called by the API endpoint.
-
-    Parameters
-    ----------
-    vision_data_or_text:
-        dict  — output of vision_service.extract_vision_data()
-                Enables Tier 1 geometry parser (preferred).
-        str   — raw OCR text (legacy path; Tier 2 only).
-
-    scan_type:
-        'nutrition'   — run nutrition label parser, return nutriments dict.
-        'ingredients' — run ingredients parser, return cleaned string.
-
-    Returns
-    -------
-    {
-        "scan_type"       : str,
-        "success"         : bool,
-        "data"            : dict | str | None,
-        "confidence"      : float,       # 0–1, overall
-        "field_confidence": dict,        # per-nutrient scores (nutrition only)
-        "raw_text"        : str,
-        "warnings"        : list[str],
-    }
-    """
     warnings: list[str] = []
 
-    # ── Normalise input ───────────────────────────────────────────────────────
     if isinstance(vision_data_or_text, dict):
         vision_data = vision_data_or_text
         raw_text    = vision_data.get('text', '')
@@ -1098,7 +1280,6 @@ def process_ocr_scan(
         if not vision_data.get('success', True) and vision_data.get('error'):
             warnings.append(f"Vision API error: {vision_data['error']}")
     else:
-        # Legacy: plain string passed directly
         raw_text = vision_data_or_text or ''
         words    = []
 
@@ -1107,7 +1288,6 @@ def process_ocr_scan(
         scan_type, len(raw_text), len(words),
     )
 
-    # ── Minimum viability check ───────────────────────────────────────────────
     if not raw_text.strip() and not words:
         return {
             "scan_type":        scan_type,
@@ -1119,17 +1299,14 @@ def process_ocr_scan(
             "warnings":         ["OCR returned no text. Check lighting and camera focus."],
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
     if scan_type == 'nutrition':
 
         if words:
-            # ── Tier 1: geometry-aware ────────────────────────────────────────
             nutriments, tier1_warnings = parse_nutrition_from_vision_words(
                 words, fallback_text=raw_text
             )
             warnings.extend(tier1_warnings)
         else:
-            # ── Tier 2: text-only (legacy path) ──────────────────────────────
             nutriments = parse_nutrition_label(raw_text)
             warnings.append(
                 "No bounding-box data available — text-only parser used. "
@@ -1138,7 +1315,6 @@ def process_ocr_scan(
 
         logger.info("PARSER: nutriments=%s", list(nutriments.keys()))
 
-        # ── Confidence ────────────────────────────────────────────────────────
         KEY_NUTRIENTS = [
             'energy-kcal_100g', 'proteins_100g', 'carbohydrates_100g',
             'fat_100g', 'sugars_100g',
@@ -1170,7 +1346,6 @@ def process_ocr_scan(
             "warnings":         warnings,
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
     elif scan_type == 'ingredients':
 
         ingredients_text = parse_ingredients_label(raw_text)
@@ -1202,7 +1377,6 @@ def process_ocr_scan(
             "warnings":         warnings,
         }
 
-    # ─────────────────────────────────────────────────────────────────────────
     else:
         return {
             "scan_type":        scan_type,

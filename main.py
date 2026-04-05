@@ -5,7 +5,7 @@ from services import fetch_product_from_google, openFoodAPI_fetch
 from parse_additives import parse_additives
 from ai import evaluate_product
 from ocr_parser import process_ocr_scan, _fuzzy_product_name_match
-from vision_service import extract_text_from_image
+from vision_service import extract_vision_data
 from off_submit import submit_product_to_off, fuzzy_search_off
 
 app = FastAPI()
@@ -163,26 +163,22 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
         print(f"\nOCR scan: barcode={request.barcode} type={request.scan_type}")
 
         # ── Step 1: Vision API ────────────────────────────────────────────────
-        raw_text = extract_text_from_image(request.image_base64)
+        vision_data = extract_vision_data(request.image_base64)
 
-        if not raw_text:
+        if not vision_data.get("success"):
             return {
                 "success": False,
                 "scan_type": request.scan_type,
-                "error": "Could not extract text from image. Ensure good lighting and that the label fills the frame.",
+                "error": vision_data.get("error", "Could not extract text from image. Ensure good lighting and that the label fills the frame."),
                 "data": None,
                 "confidence": 0.0,
                 "warnings": []
             }
-
-        if isinstance(raw_text, dict):
-            text = raw_text.get("fullTextAnnotation", {}).get("text", "")
-            print(f"Vision API extracted {len(text)} chars")
-        else:
-            print(f"Vision API extracted {len(raw_text)} chars")
+        print(f"Vision API extracted {len(vision_data.get('text', ''))} chars and {len(vision_data.get('words', []))} words")
 
         # ── Step 2: Parse and normalize ───────────────────────────────────────
-        result = process_ocr_scan(raw_text, request.scan_type)
+        # FIX: Pass vision_data here instead of raw_text!
+        result = process_ocr_scan(vision_data, request.scan_type)
 
         print(f"Parse result: success={result['success']} confidence={result['confidence']}")
 
