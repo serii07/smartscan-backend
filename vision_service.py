@@ -64,7 +64,7 @@ def extract_text_from_image(image_base64: str) -> Optional[str]:
 
         print(f"VISION: extracted text length={len(text.strip()) if text else 0}", flush=True)
 
-        return responses[0].get("fullTextAnnotation", {})
+        return responses[0]
 
     except requests.RequestException as e:
         print(f"VISION ERROR: {e}", flush=True)

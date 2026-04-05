@@ -175,7 +175,11 @@ async def ocr_scan(request: OcrScanRequest, background_tasks: BackgroundTasks):
                 "warnings": []
             }
 
-        print(f"Vision API extracted {len(raw_text)} chars")
+        if isinstance(raw_text, dict):
+            text = raw_text.get("fullTextAnnotation", {}).get("text", "")
+            print(f"Vision API extracted {len(text)} chars")
+        else:
+            print(f"Vision API extracted {len(raw_text)} chars")
 
         # ── Step 2: Parse and normalize ───────────────────────────────────────
         result = process_ocr_scan(raw_text, request.scan_type)
